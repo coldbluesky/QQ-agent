@@ -1910,9 +1910,15 @@ async function loadMemoryDetail(chatKey) {
   const detail = $('#memory-detail');
   detail.innerHTML = '<div class="empty-hint">加载中…</div>';
   try {
-    const [mem, cfg] = await Promise.all([
+    const [mem, cfg, sumRes] = await Promise.all([
       api(`/api/memory-files/${chatKey.replace(':', '_')}`),
-      api('/api/config')
+      api('/api/config'),
+      // 前情摘要：本次详情页要用它渲染摘要卡片（下面的 sumRes?.summary / .pending）。
+      // ⚠️ 这个请求曾经整个漏掉 —— 渲染代码在、取数语句不在，打开记忆详情必抛
+      //    `ReferenceError: sumRes is not defined`，被函数自己的 catch 吞成
+      //    「加载失败：sumRes is not defined」，于是整个记忆页打不开（群友印象也看不到）。
+      //    摘要接口失败不该拖垮整页，所以单独 catch 成 null（渲染侧用的是 sumRes?.）。
+      api(`/api/memory-files/${chatKey.replace(':', '_')}/summary`).catch(() => null)
     ]);
     const notes = cfg.memberNotes || {};
     const kind = chatKey.startsWith('group') ? 'group' : 'private';

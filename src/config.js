@@ -196,8 +196,10 @@ export const DEFAULT_CONFIG = {
   snowluma: {
     dir: '',                   // SnowLuma 程序目录；留空 = 自动探测项目内 ./snowluma
     autoLaunch: false,         // 应用启动时自动拉起 SnowLuma（未运行时）
-    wsUrl: 'ws://127.0.0.1:3001',
-    httpUrl: 'http://127.0.0.1:3000',
+    // 第二实例默认连自己的 OneBot 端口（3001/3000 + 偏移），
+    // 否则两个实例会同时连到主实例的 SnowLuma，消息被处理两遍（群里重复回复）。
+    wsUrl: `ws://127.0.0.1:${3001 + portOffset()}`,
+    httpUrl: `http://127.0.0.1:${3000 + portOffset()}`,
     accessToken: '',           // WebSocket 令牌
     httpAccessToken: ''        // HTTP API 令牌（SnowLuma 可与 WS 不同；留空沿用 accessToken）
   },
@@ -324,8 +326,8 @@ export const DEFAULT_CONFIG = {
   },
   // 桌面端/控制台
   server: {
-    // 主实例 3210；实例 N 整体 +100（N*100），避免多开时 HTTP/OneBot 端口互撞
-    port: 3210 + portOffset(),
+    // 端口：QQ_AGENT_PORT 显式覆盖 > 默认 3210 + 实例号 ×100（多开时避免撞端口）
+    port: Number(process.env.QQ_AGENT_PORT) || (3210 + portOffset()),
     token: '',                // 留空 = 只监听 127.0.0.1
     autoStart: false,         // 开机自启（仅 Electron 桌面端生效）
     closeToTray: true,        // 点关闭 = 最小化到托盘

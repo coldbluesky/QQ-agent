@@ -656,6 +656,113 @@ try {
     fail++; console.log('  FAIL 批量价格弹窗抛错: ' + (e && e.message));
   }
 
+  // ── 记忆详情页（2026-09-25 回归）──
+  // `loadMemoryDetail` 的渲染代码用了 sumRes，却**从未请求过它** —— 打开记忆详情
+  // 必抛 `ReferenceError: sumRes is not defined`，被函数自己的 catch 吞成
+  // 「加载失败：sumRes is not defined」，于是整个记忆页打不开（群友印象也看不到）。
+  // node --check 查不出来，旧用例也没覆盖（只测了设置页的"记忆分区"，没测详情页），
+  // 所以这里起**真实后端**跑一遍详情渲染，同时验证它依赖的三个接口真实存在 ——
+  // 与上面"用量页接口必须真实存在"同理，避免前端 mock 自洽、线上 404。
+  console.log('\n=== 记忆详情页（含前情摘要）===');
+  try {
+    const { createApp: createApp4 } = await import('../src/app.js');
+    const http4 = await import('node:http');
+    const memApp = createApp4({ log: () => {} });
+    const memPort = await memApp.start(40992);
+
+    const probe = (p) => new Promise((r) => {
+      http4.request({ host: '127.0.0.1', port: memPort, path: p, method: 'GET',
+        headers: { 'x-console-token': 'qq-agent-console' } },
+        (res) => { let d = ''; res.on('data', (c) => (d += c)); res.on('end', () => r({ code: res.statusCode, d })); }
+      ).on('error', () => r({ code: 0, d: '' })).end();
+    });
+
+    // 详情页要打三个接口：记忆本体、配置（备注名）、前情摘要
+    for (const p of ['/api/memory-files/group_123', '/api/config', '/api/memory-files/group_123/summary']) {
+      const r = await probe(p);
+      const ok = r.code === 200;
+      ok ? pass++ : fail++;
+      console.log('  ' + (ok ? 'OK   ' : 'FAIL ') + '详情页接口可用 ' + p + ' → HTTP ' + r.code);
+    }
+    // 摘要接口的**结构**也得对上（前端解构 summary / pending）
+    const sumProbe = await probe('/api/memory-files/group_123/summary');
+    let sumShape = {};
+    try { sumShape = JSON.parse(sumProbe.d || '{}'); } catch { /* 上面已判过 200 */ }
+    const okShape = !!sumShape.summary && typeof sumShape.summary === 'object' && 'pending' in sumShape;
+    okShape ? pass++ : fail++;
+    console.log('  ' + (okShape ? 'OK   ' : 'FAIL ') + '摘要接口返回 { summary, pending }');
+
+    // 用真实后端的应答喂给详情渲染（fetch 桩转发到 memPort）
+    const realFetch4 = sandbox.fetch;
+    sandbox.fetch = async (url, options) => {
+      const u = String(url);
+      if (!u.startsWith('/api/')) return realFetch4(url, options);
+      return await new Promise((resolve, reject) => {
+        const req = http4.request({
+          host: '127.0.0.1', port: memPort, path: u, method: options?.method || 'GET',
+          headers: { 'content-type': 'application/json', 'x-console-token': 'qq-agent-console' }
+        }, (res) => {
+          let d = '';
+          res.on('data', (c) => (d += c));
+          res.on('end', () => resolve({
+            ok: res.statusCode < 400,
+            status: res.statusCode,
+            json: async () => { try { return JSON.parse(d || '{}'); } catch { return {}; } }
+          }));
+        });
+        req.on('error', reject);
+        if (options?.body) req.write(options.body);
+        req.end();
+      });
+    };
+
+    const memDetail = document.querySelector('#memory-detail');
+    memDetail.innerHTML = '';
+    await ctx.loadMemoryDetail('group:123');
+    sandbox.fetch = realFetch4;
+
+    const memHtml = String(memDetail.innerHTML || '');
+    // 注意：ReferenceError 会被函数内部的 catch 吞成"加载失败：…"，
+    // 所以不能只看"没抛异常"，必须看渲染结果里有没有那句错误文案。
+    const okNoErr = !memHtml.includes('加载失败');
+    okNoErr ? pass++ : fail++;
+    console.log('  ' + (okNoErr ? 'OK   ' : 'FAIL ') + '详情页不报"加载失败"'
+      + (okNoErr ? '' : ' -> ' + memHtml.slice(0, 160)));
+    const okCard = memHtml.includes('前情摘要');
+    okCard ? pass++ : fail++;
+    console.log('  ' + (okCard ? 'OK   ' : 'FAIL ') + '前情摘要卡片已渲染'
+      + (okCard ? '' : ' -> ' + memHtml.slice(0, 160)));
+
+    // ── 其余页签视图冒烟（技能 / 实例 / 移植层）──
+    // 与记忆详情同类：都是"异步取数 → 拼字符串"的渲染函数，引用未定义变量时
+    // node --check 查不出来，页面上只显示一句"加载失败"。这三个页签是后加的，
+    // 之前从未被任何测试执行过 —— 一并在这里跑通，顺带验证它们依赖的接口存在。
+    console.log('\n  --- 其余页签视图冒烟 ---');
+    for (const [fnName, sel, label] of [
+      ['loadSkillsView', '#skills-page', '技能'],
+      ['loadInstancesView', '#instances-page', '实例'],
+      ['loadPortedView', '#ported-page', '移植层']
+    ]) {
+      const box = document.querySelector(sel);
+      box.innerHTML = '';
+      box.dataset.loaded = '0';
+      let thrown = '';
+      try {
+        await ctx[fnName](true);
+      } catch (e) {
+        thrown = e?.message ?? String(e);
+      }
+      const viewHtml = String(box.innerHTML || '');
+      const bad = thrown || !viewHtml.length || viewHtml.includes('加载失败');
+      bad ? fail++ : pass++;
+      console.log('  ' + (bad ? 'FAIL ' : 'OK   ') + label + '页签可渲染'
+        + (bad ? ' -> ' + (thrown || viewHtml.slice(0, 140)) : ' (' + viewHtml.length + ' 字符)'));
+    }
+    await memApp.stop();
+  } catch (e) {
+    fail++; console.log('  FAIL 记忆详情页测试抛错: ' + (e && e.message));
+  }
+
 } catch (e) {
   fail++;
   console.log('\n加载 app.js 失败: ' + (e && e.message));
