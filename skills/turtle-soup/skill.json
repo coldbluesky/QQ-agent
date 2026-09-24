@@ -1,0 +1,38 @@
+{
+  "id": "turtle-soup",
+  "name": "海龟汤",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "category": "utility",
+  "description": "群聊情景推理游戏：你出汤面、群友用「是/不是」提问、你把控汤底，猜中核心才揭晓答案。",
+  "author": "QQ Agent",
+  "enabledByDefault": false,
+  "capabilities": [],
+  "requires": [],
+  "settings": {
+    "allowCustomPuzzle": true,
+    "strictYesNo": true
+  },
+  "configSchema": {
+    "allowCustomPuzzle": {
+      "type": "boolean",
+      "label": "允许自编题目",
+      "description": "开启后，模型可以在题库之外自己现编一道题（自己写汤面和汤底）。关掉则只从内置题库出题，答案质量更可控。"
+    },
+    "strictYesNo": {
+      "type": "boolean",
+      "label": "严格只答是/不是",
+      "description": "开启后主持人只能用「是 / 不是 / 无关 / 是也不是」回答，一个字都不多解释——更原汁原味，也更难被套话。关掉后允许极简短地点一下，气氛更轻松。"
+    }
+  },
+  "prompt": {
+    "sections": [
+      {
+        "id": "turtle-soup-usage",
+        "title": "海龟汤",
+        "priority": 45,
+        "content": "有群友想玩海龟汤 / 情景推理、或让你出一道推理题时，调用 turtle-soup__start 开局（工具会自动把汤面发到群里）。开局后你就是主持人：用「是 / 不是 / 无关 / 是也不是」回答提问，绝不透露汤底；有人说出核心真相时调用 turtle-soup__reveal 公布答案。没人想玩的时候别主动开局——这是个点着才玩的游戏。"
+      }
+    ]
+  }
+}
