@@ -292,6 +292,10 @@ refs:
     proactive: { enabled: false },
     sticker: { enabled: true, collectEnabled: true },
     store: { maxMessagesPerChat: 0, pastStateLimit: 80, pastStateMaxChars: 6000, keepSessionFiles: 100 },
+    // 前情摘要默认关掉：它会在**每次运行结束后**额外发一次模型请求，而 mock LLM 是按
+    // 绝对请求下标取脚本的（state.script[step]）—— 意外的额外调用会让后面所有脚本错位。
+    // 需要时在专门的场景里开，并自己按当前下标挂脚本。
+    summary: { enabled: false },
     server: { port: await freePort(), token: '' }
   };
   fs.writeFileSync(path.join(dataDir, 'config.json'), JSON.stringify(cfg));
@@ -1330,7 +1334,7 @@ refs:
     assert.equal(sliderToTier(NaN).tier, 4, 'NaN 应回落到 4 档');
 
     // 后端权威派生：只传滑条位置，后端应算出档位与概率
-    const { updateConfig } = await import('../src/config.js');
+    const { updateConfig, loadConfig, setRuntimeConfig } = await import('../src/config.js');
     const fs2 = await import('node:fs');
     // ⚠️ 必须读写本次测试自己的临时数据目录。
     // 这里曾经写死相对路径 'data/config.json'，那指向的是**项目根目录下的用户数据目录**：
@@ -1345,6 +1349,12 @@ refs:
       assert.ok(Math.abs(n.store.randomPercent - 50) < 1, '后端应把 55% 派生为 50% 概率');
     } finally {
       if (hadCfg) fs2.writeFileSync(cfgPath, backup, 'utf8');
+      // ⚠️ 还必须还原**内存里的**配置：updateConfig 改的是模块内的 currentConfig，
+      // 只还原磁盘文件的话，后续所有场景都会一直跑在"3 档 + 50% 随机响应"上 ——
+      // 表现为普通消息到底触不触发运行变成掷骰子，测试随机挂（很难查）。
+      // 用 loadConfig() 而不是 JSON.parse(backup)：前者会补回默认值（= 当时的真实内存态）。
+      setRuntimeConfig(loadConfig());
+      assert.equal(loadConfig().store.contextTier, 4, '复位后档位应回到默认 4 档');
     }
     pass('响应档位滑条：分区 + 概率线性 + 后端权威派生');
   }
@@ -1563,6 +1573,145 @@ refs:
 
     fs.rmSync(songsDir, { recursive: true, force: true });
     pass('曲库：清单容错 + 无清单扫描回退 + 找歌 + 切片规划（chorusAt 生效）+ 歌单摘要');
+  }
+
+  // ── 场景 40：群友印象"发现活跃成员"——零印象的新群也能建出第一条 ──
+  // 回归：早先的门槛是"印象总数 > 4 才整理"，而整理模式又只合并/删减、不新增，
+  // 于是新群/冷群永远建不出第一条印象（实测有群聊了 200+ 条却零印象）。
+  {
+    const freshChat = 'group:789';
+    await fetch(`http://127.0.0.1:${cfg.server.port}/api/config`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ allow: { groups: ['456', '789'], private: ['777'] } })
+    });
+    // 造一个全新会话：零印象，但某人有 22 条发言（超过 discoverMinMessages=20）
+    for (let k = 0; k < 22; k++) {
+      app.store.appendIncoming(freshChat, {
+        mid: 9800 + k,
+        ts: Date.now() - (40 - k) * 1000,
+        senderId: '556',
+        senderName: '新人群友',
+        text: `新人发言 ${k + 1}`
+      });
+    }
+    // 这 22 条只是"背景发言"，不该成为触发批 —— 否则会话的触发摘要会变成
+    // "新人发言 1"（第一条未读），下面按文本等会话就等不到了。
+    // 标记已读后它们照样进聊天记录，被 #scanChatActivity 数到，只是不再触发运行。
+    app.store.markAllRead(freshChat);
+    assert.strictEqual(app.memory.consolidationState(freshChat).counts.memberImpression, 0, '新会话初始零印象');
+
+    // 跑一次：运行结束后应自动进入"发现活跃群友"，为 556 建出印象。
+    // mock 按绝对下标取脚本 —— 下标 idx 是运行本身，idx+1 是随后的整理调用。
+    const idx = llm.state.requests.length;
+    llm.state.script[idx] = { content: '（看到新人刷屏了，不回）' };
+    llm.state.script[idx + 1] = { content: JSON.stringify({ impressions: ['话多，爱聊技术话题'] }) };
+    onebotWs.push({
+      post_type: 'message', message_type: 'group', group_id: 789, user_id: 556, self_id: 888,
+      message_id: 9700, time: Math.floor(Date.now() / 1000),
+      sender: { user_id: 556, card: '新人群友', nickname: '新人群友' },
+      // 明确艾特：不依赖档位判定，避免"这条到底该不该回应"引入随机性
+      message: [{ type: 'text', data: { text: '@审计Bot 新人报到' } }]
+    });
+    await waitSessionDone('新人报到', 20000);
+
+    // 运行结束后应自动进入"发现活跃群友"，为 556 调一次模型。
+    // ⚠️ 只断言"多了一次模型调用"，不断言它落在哪个下标 —— mock 是按绝对下标取脚本的
+    // （state.script[step]），中间可能插进别的运行（如 drain），绑死下标会假失败。
+    // 旧逻辑（"印象数 > 4 才整理"）在这里一次调用都不会有，所以这个断言是有牙齿的。
+    const extra = await waitFor(() => {
+      const n = llm.state.requests.length - idx;
+      return n >= 2 ? n : null;
+    }, 15000, '零印象的新群自动发现活跃群友并调用模型');
+    assert.ok(extra >= 2, `运行结束后应额外发生一次整理调用（实际只多 ${extra - 1} 次）`);
+    const memCall = llm.state.requests.find(
+      (r) => String(r.messages?.[0]?.content || '').includes('记忆模块')
+        && String(r.messages?.[1]?.content || '').includes('556')
+    );
+    assert.ok(memCall, '这次自动整理确实是为 556 发起"提炼长期印象"');
+    pass('群友印象：零印象的群也能自动发现活跃成员（旧逻辑因"印象数不超阈值"完全不触发）');
+  }
+
+  // ── 场景 41：前情摘要（跨会话的对话记忆）──
+  {
+    const sm = await import('../src/summary.js');
+
+    // ── 纯函数：折叠选段 ──
+    const msgs = Array.from({ length: 30 }, (_, k) => ({ id: k + 1, text: `m${k + 1}` }));
+    assert.deepStrictEqual(
+      sm.pickMessagesToFold(msgs, { keepRaw: 10, throughId: 0, maxInputMsgs: 100 }).map((m) => m.id),
+      Array.from({ length: 20 }, (_, k) => k + 1),
+      '保留最后 10 条原文，其余按旧→新折叠'
+    );
+    // 单批上限必须取"最旧的一批"：取最新的话，被跳过那段的消息 id 会永远小于新的
+    // throughId，此后再也折不到 —— 那部分内容就永久丢了。
+    assert.deepStrictEqual(
+      sm.pickMessagesToFold(msgs, { keepRaw: 10, throughId: 0, maxInputMsgs: 5 }).map((m) => m.id),
+      [1, 2, 3, 4, 5],
+      '超出单批上限时取最旧的一批（不能跳段）'
+    );
+    assert.deepStrictEqual(
+      sm.pickMessagesToFold(msgs, { keepRaw: 10, throughId: 20, maxInputMsgs: 5 }).map((m) => m.id),
+      [],
+      '已折叠过的不重复折叠（幂等）'
+    );
+    assert.strictEqual(sm.pickMessagesToFold(msgs, { keepRaw: 100, throughId: 0 }).length, 0, '消息不足保留数时什么都不折');
+    assert.strictEqual(sm.resolveKeepRaw(60, 20), 20, '保留数不得超过本次读取窗口（否则出现既没进摘要也没进原文的盲区）');
+    assert.strictEqual(sm.resolveKeepRaw(60, 0), 60, '读取窗口未知时退回 keepRaw');
+    assert.strictEqual(sm.cleanSummaryText('```\n摘要：\n今天聊了球赛\n```', 200), '今天聊了球赛', '剥掉代码块围栏与"摘要："前缀');
+    assert.strictEqual(sm.cleanSummaryText('   \n ', 200), '', '空结果返回空串（调用方据此保留原摘要）');
+    assert.ok(
+      sm.buildFoldPrompt({ prevText: '旧摘要内容', messages: [{ id: 1, senderName: '张三', text: '吃了吗' }], maxChars: 300 })
+        .user.includes('旧摘要内容'),
+      '折叠提示词带上已有摘要'
+    );
+    pass('前情摘要：折叠选段 / 保留数 / 正文清洗 的纯函数行为正确');
+
+    // ── 端到端：手动折叠 → 落盘 → 注入下一次提示词 ──
+    const apiBase = `http://127.0.0.1:${cfg.server.port}`;
+    await fetch(`${apiBase}/api/config`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ summary: { enabled: true, keepRaw: 6, minFold: 1, maxChars: 300 } })
+    });
+    // mock 按绝对下标取脚本：折叠调用就在下一个下标。
+    // 多挂一个下标作保险 —— 万一中间插进一次运行，折叠会落到下一个下标上；
+    // 那次运行的回复变成摘要文本只是难看，不影响本场景的断言。
+    const idx40 = llm.state.requests.length;
+    const foldScript = { content: '```\n摘要：\n他们聊过球赛和宵夜，约好周末一起看球。\n```' };
+    llm.state.script[idx40] = foldScript;
+    llm.state.script[idx40 + 1] = foldScript;
+    const foldResp = await fetch(`${apiBase}/api/memory-files/summary/fold`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ chatKey: 'group:456' })
+    });
+    assert.strictEqual(foldResp.status, 202, '手动折叠接口已启动');
+
+    const readSummary = async () => (await (await fetch(`${apiBase}/api/memory-files/group_456/summary`)).json());
+    const foldedState = await waitFor(async () => {
+      const r = await readSummary();
+      return r.summary?.text ? r : null;
+    }, 15000, '前情摘要已生成');
+    assert.ok(foldedState.summary.text.includes('球赛'), '摘要正文来自模型输出');
+    assert.strictEqual(foldedState.summary.text.includes('```'), false, '代码块围栏已剥掉');
+    assert.ok(foldedState.summary.throughId > 0, '折叠游标已推进');
+    assert.ok(foldedState.summary.folded >= 6, `折叠条数 ≥ 滑出窗口的条数（实际 ${foldedState.summary.folded}）`);
+    assert.strictEqual(typeof foldedState.pending, 'number', '接口带回"还有多少条待折叠"');
+    pass('前情摘要：折叠落盘 + 围栏清洗 + 游标推进');
+
+    // 注入：下一次运行的提示词里必须出现【前情摘要】，且排在【过去状态】之前。
+    // ⚠️ 提示词取自**会话自己的 inputMessages**，不是 mock 请求列表的 at(-1) ——
+    // 运行结束后后台还会冒出记忆整理等请求，at(-1) 很可能不是这次运行
+    // （踩过：断言因此反复假失败，而实际注入一直是好的）。
+    llm.state.script[llm.state.requests.length] = { content: '（看到了前情，不回）' };
+    pushGroupMsg(111, '张三', '接着刚才的话题说', 9901);
+    const injSession = await waitSessionDone('接着刚才的话题说', 20000);
+    const promptWithSummary = String(injSession.inputMessages?.[1]?.content ?? '');
+    assert.ok(promptWithSummary.includes('【前情摘要】'), '提示词含【前情摘要】段');
+    assert.ok(promptWithSummary.includes('球赛'), '提示词带上了摘要正文');
+    assert.ok(
+      promptWithSummary.indexOf('【前情摘要】') < promptWithSummary.indexOf('【过去状态】'),
+      '摘要排在【过去状态】之前（时间上更早）'
+    );
+    pass('前情摘要：注入提示词且排在【过去状态】之前');
   }
 
   // ── 收尾 ──

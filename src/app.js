@@ -23,6 +23,7 @@ import { importFromDsh, currentProviders, setProviderKey, testAllProviders, test
 import { scanModelsVision, visionResults, modelImageVerdict } from './vision-scan.js';
 import { builtinVisionResults } from './model-vision-docs.js';
 import { speak, testVoice } from './tts.js';
+import { loadSummary, saveSummary, clearSummary, pickMessagesToFold, resolveKeepRaw } from './summary.js';
 import { loadSongLibrary, songsStatus, SONGS_DIR } from './songs.js';
 import { createEventBus, todayKey } from './util.js';
 
@@ -1410,6 +1411,56 @@ export function createApp({ log = console.log } = {}) {
         } catch (error) {
           return json(res, 400, { ok: false, error: String(error?.message ?? error) });
         }
+      }
+
+      // ── 前情摘要（跨会话的对话记忆）──
+      const summaryMatch = /^\/api\/memory-files\/(group|private)_(\d+)\/summary$/.exec(pathname);
+      if (summaryMatch) {
+        const chatKey = `${summaryMatch[1]}:${summaryMatch[2]}`;
+        if (method === 'GET') {
+          const st = loadSummary(chatKey);
+          // 顺带告诉前端"还有多少条旧消息在排队等折叠"，否则用户看到摘要停更
+          // 会以为功能坏了（其实是滑出窗口的消息还没攒够 minFold）。
+          const cfgNow = getConfig();
+          const keepRaw = resolveKeepRaw(cfgNow.summary?.keepRaw, Number(cfgNow.store?.allCount) || 0);
+          const all = store.recent(chatKey, { limit: 1000000 });
+          const cutoff = Math.max(0, all.length - keepRaw);
+          const pending = all.slice(0, cutoff).filter((m) => Number(m.id) > st.throughId).length;
+          return json(res, 200, { ok: true, summary: st, keepRaw, pending });
+        }
+        if (method === 'PUT') {
+          const body = await readBody(req).catch(() => ({}));
+          if (body.text === undefined || body.text === null) {
+            return json(res, 400, { ok: false, error: '缺少 text 字段' });
+          }
+          const saved = saveSummary(chatKey, { text: String(body.text).slice(0, 4000) });
+          emit('memory-update', { chatKey });
+          return json(res, 200, { ok: true, summary: saved });
+        }
+        if (method === 'DELETE') {
+          const cleared = clearSummary(chatKey);
+          emit('memory-update', { chatKey });
+          return json(res, 200, { ok: true, summary: cleared });
+        }
+      }
+
+      // 手动触发一次摘要折叠（跳过 minFold 门槛，把排队的旧消息立刻折进去）
+      if (pathname === '/api/memory-files/summary/fold' && method === 'POST') {
+        const body = await readBody(req).catch(() => ({}));
+        const chatKey = String(body.chatKey || '');
+        if (!/^(group|private):\d+$/.test(chatKey)) return json(res, 400, { ok: false, error: 'chatKey 格式错误' });
+        if (orchestrator.folding.has(chatKey)) return json(res, 409, { ok: false, error: '该会话已在折叠中' });
+        orchestrator.folding.add(chatKey);
+        emit('memory-update', { chatKey, phase: 'summary-start' });
+        orchestrator
+          .foldSummaryForChat(chatKey, {
+            force: true,
+            contextLimit: Number(getConfig().store?.allCount) || 0
+          })
+          .then((result) => emit('memory-update', { chatKey, phase: 'summary-done', ...(result || {}) }))
+          .catch((error) => emit('memory-update', { chatKey, phase: 'summary-error', error: String(error?.message ?? error) }))
+          .finally(() => orchestrator.folding.delete(chatKey));
+        return json(res, 202, { ok: true, started: true });
       }
 
       const chatMsgMatch = /^\/api\/chats\/(group|private)_(\d+)\/messages$/.exec(pathname);

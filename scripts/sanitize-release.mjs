@@ -216,6 +216,7 @@ if (!SCAN_ONLY) {
   rmrf('messages', '聊天存档');
   rmrf('sessions', '会话留档');
   rmrf('memory', '记忆');
+  rmrf('summary', '前情摘要');
   rmrf('stickers.json', '表情库');
   rmrf('voice', '语音缓存');
   rmrf('usage-today.json', '今日用量');

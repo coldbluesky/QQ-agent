@@ -501,6 +501,16 @@ export function buildUserPrompt(ctx) {
   }
   parts.push(`【此刻状态】\n${stateLines.join('\n')}`);
 
+  // 前情摘要：比【过去状态】更早、已被折叠压缩的旧对话，即跨会话的长期记忆。
+  // 排在原文之前，时间上正好接续（摘要 → 原文 → 本次唤醒）。
+  const summaryText = String(ctx.summaryText || '').trim();
+  if (summaryText) {
+    parts.push(
+      '【前情摘要】以下是这个会话更早之前的经过（已被压缩成摘要，属于你的长期记忆；' +
+      `细节可能不全，时间上早于下面的聊天记录，别把它当成刚刚发生的事）：\n${summaryText}`
+    );
+  }
+
   // 过去状态
   if (past.text) {
     parts.push(`【过去状态】以下是这个会话最近的聊天记录（按时间排序，你的发言标为"我"；这些都已经看过；带图的消息前有 #消息id，看图/收藏表情工具要用它）：\n${past.text}`);

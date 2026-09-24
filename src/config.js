@@ -249,7 +249,30 @@ export const DEFAULT_CONFIG = {
     consolidateMinIntervalMs: 21600000,  // 默认 6 小时
     useChatModel: true,                   // true = 整理模型跟随聊天模型；false = 使用下方专用模型
     provider: '',                         // 专用模型所属提供商 id（useChatModel=false 时生效）
-    model: ''                             // 专用模型 id（useChatModel=false 时生效）
+    model: '',                            // 专用模型 id（useChatModel=false 时生效）
+    // 无印象的活跃群友也纳入整理（新建印象）。
+    // 关掉的话，只有"印象数已超阈值"才会整理，而整理模式只合并/删减、不新增 ——
+    // 于是新群/冷群永远攒不出第一条印象（实测有群聊了 200+ 条却零印象）。
+    discoverActiveMembers: true,
+    discoverMaxMembers: 6                 // 单次最多为几位活跃群友新建印象（控制单次成本）
+  },
+  // 前情摘要：跨会话的对话记忆。
+  // 每次运行结束后，把"这次没看到原文的旧消息"折叠进一份持久化摘要，
+  // 下次唤醒时连同【过去状态】的最近原文一起注入。
+  // 摘要正文有固定字数上限 → 注入成本有界，不会随聊天量膨胀（保住"单次成本恒定"）。
+  summary: {
+    enabled: true,
+    // 最近多少条**不进摘要**、始终以原文出现在【过去状态】里。
+    // 实际保留数还会与本次读取窗口取较小值，避免出现"既没进摘要、也没被原文带进提示词"
+    // 的盲区（读取条数按上下文档位是 8~80 不等）。
+    keepRaw: 60,
+    maxChars: 1200,          // 摘要正文字数上限（注入成本上限）
+    minFold: 5,              // 至少积攒这么多条旧消息才折叠一次（1 = 每轮运行后都折叠）
+    maxInputMsgs: 200,       // 单次折叠最多喂多少条新滑出的消息
+    useChatModel: true,      // 折叠模型跟随聊天模型；false = 用下方专用模型
+    provider: '',
+    model: '',
+    timeoutMs: 120000
   },
   // 桌面端/控制台
   server: {

@@ -33,7 +33,10 @@ const state = {
   // 切页签会导致记忆页 DOM 重建，状态若只存在按钮/文本节点里就会丢失，
   // 用户切回来时看不出整理是在跑还是已经结束了。
   consolidating: {},      // chatKey -> { startedAt }
-  consolidateResult: {}   // chatKey -> { note, at, failed? }
+  consolidateResult: {},  // chatKey -> { note, at, failed? }
+  // 前情摘要折叠状态：与整理同理，必须存在 state 里而不是 DOM 里。
+  summaryBusy: {},        // chatKey -> { startedAt }
+  summaryResult: {}       // chatKey -> { note, at, failed? }
 };
 
 // ── 工具函数 ──
@@ -528,6 +531,16 @@ function connectSSE() {
       if (chatKey) delete state.consolidating[chatKey];
       if (chatKey) {
         state.consolidateResult[chatKey] = { note: `整理失败：${data.error || '未知错误'}`, at: Date.now(), failed: true };
+      }
+    } else if (phase === 'summary-start') {
+      if (chatKey) state.summaryBusy[chatKey] = { startedAt: Date.now() };
+    } else if (phase === 'summary-done') {
+      if (chatKey) delete state.summaryBusy[chatKey];
+      if (chatKey) state.summaryResult[chatKey] = { note: data.note || '折叠完成', at: Date.now() };
+    } else if (phase === 'summary-error') {
+      if (chatKey) delete state.summaryBusy[chatKey];
+      if (chatKey) {
+        state.summaryResult[chatKey] = { note: `折叠失败：${data.error || '未知错误'}`, at: Date.now(), failed: true };
       }
     }
 
@@ -1894,6 +1907,45 @@ async function loadMemoryDetail(chatKey) {
       </div>`;
     }).join('');
     // 整理状态从 state 恢复：切页签回来 / 刷新页面后依然可见
+    // ── 前情摘要卡片（跨会话的对话记忆）──
+    const summary = sumRes?.summary || { text: '' };
+    const summaryText = String(summary.text || '');
+    const summaryPending = Number(sumRes?.pending || 0);
+    const summaryBusy = !!state.summaryBusy?.[chatKey];
+    const summaryResult = state.summaryResult?.[chatKey];
+    let summaryStat;
+    if (summaryBusy) {
+      summaryStat = '折叠中…（要调一次模型，稍等）';
+    } else if (summaryResult) {
+      const ago = Math.max(0, Math.round((Date.now() - (summaryResult.at || 0)) / 1000));
+      summaryStat = `${summaryResult.note}（${ago < 60 ? `${ago}s 前` : `${Math.round(ago / 60)} 分钟前`}）`;
+    } else if (summaryText) {
+      summaryStat = `已折叠 ${summary.folded || 0} 条 · ${summaryText.length} 字`
+        + (summaryPending > 0 ? ` · 还有 ${summaryPending} 条待折叠` : '');
+    } else {
+      summaryStat = summaryPending > 0
+        ? `${summaryPending} 条旧消息待折叠（点「立即折叠」可马上做一次）`
+        : '还没有旧消息滑出读取窗口';
+    }
+    const summaryCard = `
+      <div class="collapsible" open style="margin-bottom:10px">
+        <summary>前情摘要（跨会话的对话记忆）
+          <button class="btn btn-small" id="mem-summary-fold-btn" ${summaryBusy ? 'disabled' : ''} style="margin-left:8px">${summaryBusy ? '折叠中…' : '立即折叠'}</button>
+          <button class="btn btn-small" id="mem-summary-edit-btn" style="margin-left:6px">编辑</button>
+          <button class="btn btn-small" id="mem-summary-clear-btn" style="margin-left:6px">清空</button>
+        </summary>
+        <div class="coll-body">
+          <div id="mem-summary-body">${esc(summaryText) || '<span class="muted">（还没有前情摘要：等最新原文滑出读取窗口后会自动折叠）</span>'}</div>
+          <div class="muted" id="mem-summary-status" style="margin-top:6px;font-size:12px">${esc(summaryStat)}</div>
+          <div id="mem-summary-editor" style="display:none;margin-top:8px">
+            <textarea id="mem-summary-text" rows="6" style="width:100%" placeholder="前情摘要正文（会注入到提示词里）">${esc(summaryText)}</textarea>
+            <div style="display:flex;gap:8px;margin-top:6px">
+              <button class="btn btn-small" id="mem-summary-save-btn">保存</button>
+              <button class="btn btn-small" id="mem-summary-cancel-btn">取消</button>
+            </div>
+          </div>
+        </div>
+      </div>`;
     const busy = !!state.consolidating[chatKey];
     const result = state.consolidateResult[chatKey];
     let consolidateStatusHtml = '';
@@ -1918,6 +1970,7 @@ async function loadMemoryDetail(chatKey) {
           ${consolidateStatusHtml}
         </div>
       </div>
+      ${summaryCard}
       ${membersHtml}
       ${rows || '<div class="muted" style="padding:10px">还没有任何群友印象（可点右上角「＋ 添加印象」手动记，或点「整理本群记忆」让模型从聊天记录里提炼）。</div>'}
     `;
@@ -1932,6 +1985,54 @@ async function loadMemoryDetail(chatKey) {
       });
     });
     $('#mem-add-imp-btn')?.addEventListener('click', () => openMemberImpressModal(chatKey, null));
+
+    // ── 前情摘要：立即折叠 / 就地编辑 / 清空 ──
+    const sumApiPath = `/api/memory-files/${chatKey.replace(':', '_')}/summary`;
+    $('#mem-summary-fold-btn')?.addEventListener('click', async () => {
+      state.summaryBusy = state.summaryBusy || {};
+      state.summaryBusy[chatKey] = { startedAt: Date.now() };
+      if (state.summaryResult) delete state.summaryResult[chatKey];
+      loadMemoryDetail(chatKey);
+      try {
+        await api('/api/memory-files/summary/fold', { method: 'POST', body: JSON.stringify({ chatKey }) });
+        // 成功时保持"折叠中"，等 SSE 的 summary-done 收尾（折叠要调模型，通常几秒）
+      } catch (e) {
+        delete state.summaryBusy[chatKey];
+        state.summaryResult = state.summaryResult || {};
+        state.summaryResult[chatKey] = { note: `折叠失败：${e.message}`, at: Date.now(), failed: true };
+        loadMemoryDetail(chatKey);
+      }
+    });
+    $('#mem-summary-edit-btn')?.addEventListener('click', () => {
+      const ed = $('#mem-summary-editor');
+      if (ed) ed.style.display = ed.style.display === 'none' ? '' : 'none';
+    });
+    $('#mem-summary-cancel-btn')?.addEventListener('click', () => {
+      const ed = $('#mem-summary-editor');
+      if (ed) ed.style.display = 'none';
+    });
+    $('#mem-summary-save-btn')?.addEventListener('click', async () => {
+      const btn = $('#mem-summary-save-btn');
+      const text = $('#mem-summary-text')?.value ?? '';
+      if (btn) { btn.disabled = true; btn.textContent = '保存中…'; }
+      try {
+        await api(sumApiPath, { method: 'PUT', body: JSON.stringify({ text }) });
+        loadMemoryDetail(chatKey);
+      } catch (e) {
+        alert(`保存失败：${e.message}`);
+        if (btn) { btn.disabled = false; btn.textContent = '保存'; }
+      }
+    });
+    $('#mem-summary-clear-btn')?.addEventListener('click', async () => {
+      if (!confirm('清空这段前情摘要？机器人会忘掉这段记忆（聊天记录本身不受影响，之后会重新累积）。')) return;
+      try {
+        await api(sumApiPath, { method: 'DELETE' });
+        if (state.summaryResult) delete state.summaryResult[chatKey];
+        loadMemoryDetail(chatKey);
+      } catch (e) {
+        alert(`清空失败：${e.message}`);
+      }
+    });
     // 针对单个群友更新记忆：有印象→整理合并；无印象→从聊天记录提炼
     $$('.mem-refresh-imp', detail).forEach((el) => {
       el.addEventListener('click', async (e) => {
@@ -3129,14 +3230,21 @@ function renderSearchSection(c) {
 
 function renderMemorySettingsSection(c) {
   const mem = c.memory || {};
+  const sum = c.summary || {};
   const providers = state.providers || [];
   const useChat = mem.useChatModel !== false;
   const selP = providers.find((p) => p.id === mem.provider);
   const currentDisplay = selP ? `${selP.displayName || selP.id} · ${mem.model || '未选模型'}` : (mem.model || '未选模型');
+  const sumUseChat = sum.useChatModel !== false;
+  const sumSelP = providers.find((p) => p.id === sum.provider);
+  const sumDisplay = sumSelP ? `${sumSelP.displayName || sumSelP.id} · ${sum.model || '未选模型'}` : (sum.model || '未选模型');
   return `
     <h3 id="settings-memory">记忆整理</h3>
     <div class="checkbox-row"><input type="checkbox" id="cfg-mem-consolidate" ${mem.consolidateEnabled !== false ? 'checked' : ''} />
       <label for="cfg-mem-consolidate">启用记忆自动整理</label></div>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-mem-discover" ${mem.discoverActiveMembers !== false ? 'checked' : ''} />
+      <label for="cfg-mem-discover">自动发现活跃群友（即使他还一条印象都没有）</label></div>
+    <div class="hint">关掉的话，只有"印象数已超阈值"才会整理；而整理本身只合并/删减、不新增，于是新群/冷群永远攒不出第一条印象。</div>
     <div class="checkbox-row"><input type="checkbox" id="cfg-mem-usechat" ${useChat ? 'checked' : ''} />
       <label for="cfg-mem-usechat">使用与聊天机器人相同的模型</label></div>
     <div id="mem-model-box" style="${useChat ? 'display:none' : ''}">
@@ -3149,8 +3257,38 @@ function renderMemorySettingsSection(c) {
         <input type="hidden" id="cfg-mem-model" value="${esc(mem.model || '')}" />
       </div>
     </div>
-    <div class="field"><label>整理冷却时间（毫秒）</label><input type="number" id="cfg-mem-interval" min="1800000" step="600000" value="${esc(mem.consolidateMinIntervalMs ?? 21600000)}" /></div>
-    <div class="hint">条数超过阈值且距上次整理超过该冷却时间后，才会在运行结束后后台整理。默认 6 小时（21600000 毫秒）。</div>`;
+    <div class="field-row">
+      <div class="field"><label>整理冷却时间（毫秒）</label><input type="number" id="cfg-mem-interval" min="300000" step="600000" value="${esc(mem.consolidateMinIntervalMs ?? 21600000)}" /></div>
+      <div class="field"><label>单次最多为几位群友建印象</label><input type="number" id="cfg-mem-discovermax" min="1" max="20" value="${esc(mem.discoverMaxMembers ?? 6)}" /></div>
+    </div>
+    <div class="hint">条数超过阈值（或开启上方的「自动发现」）且距上次整理超过冷却时间后，才会在运行结束后后台整理。默认 6 小时（21600000 毫秒），最小 5 分钟。</div>
+
+    <div class="settings-divider"></div>
+
+    <h3 id="settings-summary">前情摘要（对话记忆）</h3>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-sum-enabled" ${sum.enabled !== false ? 'checked' : ''} />
+      <label for="cfg-sum-enabled">启用前情摘要</label></div>
+    <div class="hint">每次运行结束后，把"这次没看到原文的旧消息"折叠成一份持久化摘要，下次连同最近原文一起注入。摘要字数有上限，所以单次成本仍是有界的。</div>
+    <div class="field-row">
+      <div class="field"><label>保留原文条数</label><input type="number" id="cfg-sum-keepraw" min="0" max="500" value="${esc(sum.keepRaw ?? 60)}" />
+        <div class="hint">最近这么多条不进摘要、始终以原文出现。实际还会与本次读取窗口取较小值，避免"既没进摘要也没进原文"的盲区。</div></div>
+      <div class="field"><label>摘要字数上限</label><input type="number" id="cfg-sum-maxchars" min="200" max="4000" value="${esc(sum.maxChars ?? 1200)}" />
+        <div class="hint">决定注入成本的上限。</div></div>
+      <div class="field"><label>折叠门槛（条）</label><input type="number" id="cfg-sum-minfold" min="1" max="200" value="${esc(sum.minFold ?? 5)}" />
+        <div class="hint">至少积攒这么多条旧消息才折叠一次；填 1 = 每轮运行后都折。</div></div>
+    </div>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-sum-usechat" ${sumUseChat ? 'checked' : ''} />
+      <label for="cfg-sum-usechat">折叠使用与聊天机器人相同的模型</label></div>
+    <div id="sum-model-box" style="${sumUseChat ? 'display:none' : ''}">
+      <div class="field"><label>折叠模型（点击选择）</label>
+        <div style="display:flex;gap:8px">
+          <input type="text" id="cfg-sum-model-pick" readonly placeholder="点击选择模型" value="${esc(sumDisplay)}" style="flex:1;cursor:pointer" />
+        </div>
+        <div class="hint" id="sum-model-hint">${sumSelP ? `当前：${esc(sumSelP.displayName)} @ ${esc(sumSelP.baseURL)}` : '尚未选择专用模型'}</div>
+        <input type="hidden" id="cfg-sum-provider" value="${esc(sum.provider || '')}" />
+        <input type="hidden" id="cfg-sum-model" value="${esc(sum.model || '')}" />
+      </div>
+    </div>`;
 }
 
 function renderPersonaSection(c) {
@@ -3727,6 +3865,13 @@ function bindSettingsEvents(c) {
   });
   const memModelPick = $('#cfg-mem-model-pick');
   if (memModelPick) memModelPick.addEventListener('click', () => openMemoryModelPicker());
+  const sumUseChatBox = $('#cfg-sum-usechat');
+  if (sumUseChatBox) sumUseChatBox.addEventListener('change', () => {
+    const box = $('#sum-model-box');
+    if (box) box.style.display = sumUseChatBox.checked ? 'none' : '';
+  });
+  const sumModelPick = $('#cfg-sum-model-pick');
+  if (sumModelPick) sumModelPick.addEventListener('click', () => openSummaryModelPicker());
 
   // ── 模型 API 区块事件 ──
   // 密码框显示/隐藏切换（点击按钮切换对应输入框的 type）
@@ -4488,15 +4633,21 @@ function openModelPicker() {
   overlay.querySelector('#mm-cancel').addEventListener('click', () => closeModelModal(overlay));
 }
 
-/** 选择记忆整理专用模型：复用模型目录选择器，保存到 config.memory.provider/model。 */
-function openMemoryModelPicker() {
+/**
+ * 选择"专用模型"（记忆整理 / 前情摘要折叠）的通用选择器。
+ *
+ * 两者只差"当前值读哪个 DOM 字段""写回哪个配置段"，所以共用一份实现 ——
+ * 复制成两份的话，早晚会改歪一边（记忆整理就踩过 useChatModel 不同步的坑）。
+ */
+function openDedicatedModelPicker({ head, hintSel, providerSel, modelSel, useChatSel, configKey }) {
   const providers = state.providers || [];
   if (!providers.length) {
-    $('#mem-model-hint').textContent = '模型目录为空：请先到「模型 API」页签添加提供商。';
+    $(hintSel).textContent = '模型目录为空：请先到「模型 API」页签添加提供商。';
     return;
   }
+  const cfgNow = state.config?.[configKey] || {};
   const overlay = modelModalShell({
-    head: '选择记忆整理模型',
+    head,
     body: `
       <div class="model-modal-left" id="mm-left"></div>
       <div class="model-modal-right" id="mm-right"></div>`,
@@ -4506,8 +4657,8 @@ function openMemoryModelPicker() {
   const right = overlay.querySelector('#mm-right');
   // 从 DOM 的隐藏字段读当前值（而非 state.config）：
   // 用户可能刚选过但还没保存，或 state 还没刷新，DOM 才是最新真相。
-  const currentProvider = $('#cfg-mem-provider')?.value || state.config?.memory?.provider || '';
-  const currentModel = $('#cfg-mem-model')?.value || state.config?.memory?.model || '';
+  const currentProvider = $(providerSel)?.value || cfgNow.provider || '';
+  const currentModel = $(modelSel)?.value || cfgNow.model || '';
   let activePid = currentProvider || providers[0].id;
   function renderLeft() {
     left.innerHTML = providers.map((p) =>
@@ -4535,17 +4686,16 @@ function openMemoryModelPicker() {
           // 否则：用户取消勾选（→ 只改了 DOM，state.config 仍是 true）后直接点模型，
           // 这次提交不带 useChatModel，随后 loadSettings() 又按 state.config(true)
           // 重新渲染 —— 复选框被打回"已勾选"，迫使必须先保存一次才能选模型。
-          const useChatBox = $('#cfg-mem-usechat');
-          const useChatModel = useChatBox ? !!useChatBox.checked
-            : (state.config?.memory?.useChatModel !== false);
+          const useChatBox = $(useChatSel);
+          const useChatModel = useChatBox ? !!useChatBox.checked : (cfgNow.useChatModel !== false);
           await api('/api/config', {
             method: 'POST',
-            body: JSON.stringify({ memory: { provider: pid, model, useChatModel } })
+            body: JSON.stringify({ [configKey]: { provider: pid, model, useChatModel } })
           });
           closeModelModal(overlay);
           loadSettings();
         } catch (e) {
-          $('#mem-model-hint').textContent = `选择失败：${e.message}`;
+          $(hintSel).textContent = `选择失败：${e.message}`;
           closeModelModal(overlay);
         }
       });
@@ -4554,6 +4704,30 @@ function openMemoryModelPicker() {
   renderLeft();
   renderRight();
   overlay.querySelector('#mm-cancel').addEventListener('click', () => closeModelModal(overlay));
+}
+
+/** 选择记忆整理专用模型（写回 config.memory）。 */
+function openMemoryModelPicker() {
+  openDedicatedModelPicker({
+    head: '选择记忆整理模型',
+    hintSel: '#mem-model-hint',
+    providerSel: '#cfg-mem-provider',
+    modelSel: '#cfg-mem-model',
+    useChatSel: '#cfg-mem-usechat',
+    configKey: 'memory'
+  });
+}
+
+/** 选择前情摘要折叠专用模型（写回 config.summary）。 */
+function openSummaryModelPicker() {
+  openDedicatedModelPicker({
+    head: '选择前情摘要折叠模型',
+    hintSel: '#sum-model-hint',
+    providerSel: '#cfg-sum-provider',
+    modelSel: '#cfg-sum-model',
+    useChatSel: '#cfg-sum-usechat',
+    configKey: 'summary'
+  });
 }
 
 /** “获取列表”后的勾选添加弹窗：已添加的模型显示为已选（不可重复勾选）。 */
@@ -4829,10 +5003,23 @@ async function saveConfig({ quiet = false } = {}) {
     patch.memory = {
       ...(c.memory || {}),
       consolidateEnabled: chk('#cfg-mem-consolidate', c.memory?.consolidateEnabled !== false),
+      discoverActiveMembers: chk('#cfg-mem-discover', c.memory?.discoverActiveMembers !== false),
+      discoverMaxMembers: Math.max(1, Number(val('#cfg-mem-discovermax', c.memory?.discoverMaxMembers ?? 6)) || 6),
       useChatModel: chk('#cfg-mem-usechat', c.memory?.useChatModel !== false),
       provider: val('#cfg-mem-provider', c.memory?.provider || '').trim(),
       model: val('#cfg-mem-model', c.memory?.model || '').trim(),
       consolidateMinIntervalMs: Number(val('#cfg-mem-interval', c.memory?.consolidateMinIntervalMs ?? 21600000)) || 21600000
+    };
+    // 前情摘要与「记忆整理」同页签，所以一并在这里读。
+    patch.summary = {
+      ...(c.summary || {}),
+      enabled: chk('#cfg-sum-enabled', c.summary?.enabled !== false),
+      keepRaw: Math.max(0, Number(val('#cfg-sum-keepraw', c.summary?.keepRaw ?? 60)) || 0),
+      maxChars: Math.max(200, Number(val('#cfg-sum-maxchars', c.summary?.maxChars ?? 1200)) || 1200),
+      minFold: Math.max(1, Number(val('#cfg-sum-minfold', c.summary?.minFold ?? 5)) || 5),
+      useChatModel: chk('#cfg-sum-usechat', c.summary?.useChatModel !== false),
+      provider: val('#cfg-sum-provider', c.summary?.provider || '').trim(),
+      model: val('#cfg-sum-model', c.summary?.model || '').trim()
     };
   }
 

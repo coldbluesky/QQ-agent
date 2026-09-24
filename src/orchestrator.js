@@ -18,6 +18,10 @@ import { modelImageVerdict } from './vision-scan.js';
 import { currentProviders } from './providers.js';
 import { voiceReady } from './tts.js';
 import { loadSongLibrary, songsStatus } from './songs.js';
+import {
+  loadSummary, saveSummary, clearSummary,
+  pickMessagesToFold, resolveKeepRaw, buildFoldPrompt, cleanSummaryText
+} from './summary.js';
 
 export class Orchestrator {
   constructor({ store, memory, stickers, sender, sessions, onebot, tts = null, emit = null }) {
@@ -36,6 +40,7 @@ export class Orchestrator {
     this.pendingWake = new Set();      // 防抖中等待聚批的 chatKey
     this.pendingSessions = new Map();  // chatKey -> waiting sessionId（防抖期可见的“等待中”会话）
     this.consolidating = new Set();    // 正在整理记忆的 chatKey
+    this.folding = new Set();          // 正在折叠前情摘要的 chatKey
     this.runningChats = new Set();     // 正在运行的 chatKey
     this.activeRuns = new Map();       // chatKey -> sessionId
     this.runSeq = new Map();           // chatKey -> 第几次处理（跨重启清零即可）
@@ -372,6 +377,10 @@ export class Orchestrator {
 
     // 记忆自动整理（后台静默，绝不阻塞/影响聊天主流程）
     this.#maybeConsolidateMemory(chatKey);
+    // 前情摘要折叠：把"这次没看到原文的旧消息"并进摘要。
+    // 传入本次读取窗口 tierResult.count —— 保留数不能超过它，否则会留下
+    // "既没进摘要、也没被原文带进提示词"的盲区（见 summary.js 的 resolveKeepRaw）。
+    this.#maybeFoldSummary(chatKey, tierResult.count);
   }
 
   /**
@@ -437,7 +446,11 @@ export class Orchestrator {
       moreUnreadDuringRun: this.store.unreadCount(chatKey) > 0,
       proactive,
       contextLimit,
-      tierInfo
+      tierInfo,
+      // 前情摘要（跨会话的对话记忆）：开关关掉就当它不存在，提示词里也不会出现这一段。
+      // ⚠️ 必须传进 buildUserPrompt 的这个对象 —— 提示词用的是这里的字段，
+      // 不是下面给工具用的 ctx。加错地方的表现是"折叠明明成功、提示词里却没有摘要"。
+      summaryText: cfg.summary?.enabled === false ? '' : loadSummary(chatKey).text
     });
 
     session.systemPrompt = systemPrompt;
@@ -724,7 +737,7 @@ export class Orchestrator {
   // "发现新人"：批量整理时，聊天记录里发言够多但完全没有印象的人，也纳入整理（新建印象）。
   // 否则记忆为空的群点整理会得到"没有可整理的群友"，功能对新群完全无效。
   static DISCOVER_MIN_MESSAGES = 20;      // 至少发过这么多条才值得分析
-  static DISCOVER_MAX_MEMBERS = 3;        // 单次最多发现几个人（控制成本）
+  static DISCOVER_MAX_MEMBERS = 6;        // 单次最多发现几个人（控制成本）
 
   #maybeConsolidateMemory(chatKey) {
     try {
@@ -745,7 +758,12 @@ export class Orchestrator {
       // 总数 3 永远够不到阈值，自动整理形同虚设。
       const maxPerMember = Math.max(2, Number(cfg.memory?.maxImpressionsPerMember) || 5);
       const anyMemberOverloaded = st.members.some((m) => m.count > maxPerMember);
-      if (!(st.counts.memberImpression > minImpressions) && !anyMemberOverloaded) return;
+      const overThreshold = st.counts.memberImpression > minImpressions;
+      // 「发现活跃群友」模式下，条数门槛不再是必要条件 —— 由下方的冷却时间单独限流。
+      // 只看条数的话，新群/冷群永远凑不到阈值，而整理模式又只合并删减、不新增，
+      // 于是第一条印象永远建不出来（实测有群聊了 200+ 条却零印象）。
+      const discovering = cfg.memory?.discoverActiveMembers !== false;
+      if (!overThreshold && !anyMemberOverloaded && !discovering) return;
       const minInterval = Math.max(30 * 60 * 1000, Number(cfg.memory?.consolidateMinIntervalMs) || 6 * 60 * 60 * 1000);
       if (Date.now() - (st.lastConsolidatedAt || 0) < minInterval) return;
       this.consolidating.add(chatKey);
@@ -753,6 +771,129 @@ export class Orchestrator {
         .catch((error) => console.error(`[memory] 整理 ${chatKey} 失败:`, error?.message ?? error))
         .finally(() => this.consolidating.delete(chatKey));
     } catch { /* 整理是锦上添花，绝不影响聊天主流程 */ }
+  }
+
+  // ── 前情摘要折叠 ──
+  //
+  // 与记忆整理的区别：这里**没有时间冷却** —— 摘要的价值就是新鲜，而 minFold 这道门已经
+  // 天然限流了调用频率：只有本次又有 minFold 条以上消息滑出读取窗口，才会真的调模型。
+  // 群不活跃时滑不出消息，就一次都不会调。
+  #maybeFoldSummary(chatKey, contextLimit = 0) {
+    try {
+      const cfg = getConfig();
+      if (cfg.summary?.enabled === false) return;
+      if (this.paused || this.aborted) return;
+      if (!cfg.api?.model || !cfg.api?.baseUrl) return;   // 没选模型就不折叠
+      if (this.folding.has(chatKey)) return;              // 同一会话同时只折一次
+      this.folding.add(chatKey);
+      this.foldSummaryForChat(chatKey, { contextLimit })
+        .catch((error) => console.error(`[summary] 折叠 ${chatKey} 失败:`, error?.message ?? error))
+        .finally(() => this.folding.delete(chatKey));
+    } catch { /* 摘要折叠是锦上添花，绝不影响聊天主流程 */ }
+  }
+
+  /**
+   * 折叠前情摘要 —— 唯一入口（自动触发与手动按钮都走这里）。
+   *
+   * @param {string} chatKey
+   * @param {object} [opts]
+   * @param {boolean} [opts.force]        忽略 minFold 门槛（手动触发时用）
+   * @param {number}  [opts.contextLimit] 本次读取窗口条数（决定保留多少条原文不进摘要）
+   * @returns {Promise<{ok, folded, note, ...}>} folded=0 表示这次没折（很常见，不是错误）
+   */
+  async foldSummaryForChat(chatKey, { force = false, contextLimit = 0 } = {}) {
+    const cfg = getConfig();
+    const maxChars = Math.max(200, Number(cfg.summary?.maxChars) || 1200);
+    const maxInputMsgs = Math.max(1, Number(cfg.summary?.maxInputMsgs) || 200);
+    const keepRaw = resolveKeepRaw(cfg.summary?.keepRaw, contextLimit);
+    const minFold = Math.max(1, Number(cfg.summary?.minFold) || 5);
+
+    const state = loadSummary(chatKey);
+    // 只取"保留区 + 单批上限"这么多条：窗口最前面那一段必然都已滑出保留区，
+    // 读更早的没有意义（它们要么已折叠过、要么留给下一轮）。
+    const list = this.store.recent(chatKey, { limit: keepRaw + maxInputMsgs });
+    const toFold = pickMessagesToFold(list, {
+      keepRaw,
+      throughId: state.throughId,
+      maxInputMsgs
+    });
+
+    if (!toFold.length) {
+      return { ok: true, folded: 0, note: '没有新的旧消息需要折叠' };
+    }
+    if (!force && toFold.length < minFold) {
+      return {
+        ok: true,
+        folded: 0,
+        pending: toFold.length,
+        note: `只有 ${toFold.length} 条滑出读取窗口（不足 ${minFold} 条），这次不折叠`
+      };
+    }
+    if (!cfg.api?.model || !cfg.api?.baseUrl) throw new Error('模型未配置，无法折叠前情摘要');
+
+    const { system, user } = buildFoldPrompt({ prevText: state.text, messages: toFold, maxChars });
+    const res = await this.#summaryChat([
+      { role: 'system', content: system },
+      { role: 'user', content: user }
+    ]);
+    const text = cleanSummaryText(res?.message?.content, maxChars);
+    // 空结果一律放弃，保留原摘要 —— 宁可摘要旧一点，也不能被清空
+    if (!text) throw new Error('模型返回了空的摘要，已保留原摘要');
+
+    const lastId = Number(toFold[toFold.length - 1]?.id) || state.throughId;
+    const saved = saveSummary(chatKey, {
+      text,
+      throughId: lastId,
+      folds: state.folds + 1,
+      folded: state.folded + toFold.length
+    });
+    console.log(`[summary] ${chatKey} 折叠 ${toFold.length} 条进前情摘要（累计 ${saved.folded} 条 / ${saved.text.length} 字）`);
+    return {
+      ok: true,
+      folded: toFold.length,
+      chars: saved.text.length,
+      folds: saved.folds,
+      totalFolded: saved.folded,
+      note: `已把 ${toFold.length} 条旧消息折叠进摘要（现 ${saved.text.length} 字）`
+    };
+  }
+
+  /** 清空某会话的前情摘要（手动）。 */
+  resetSummary(chatKey) {
+    return clearSummary(chatKey);
+  }
+
+  /**
+   * 摘要折叠专用模型调用。
+   * useChatModel=true 时跟随聊天模型；false 时用 cfg.summary.provider/model 指向的目录模型。
+   * 与 #memoryChat 分开：摘要是独立开关，模型也应当能单独指定。
+   */
+  async #summaryChat(messages) {
+    const cfg = getConfig();
+    const s = cfg.summary || {};
+    if (s.useChatModel !== false) {
+      // ⚠️ 这里【不能】传只带 timeoutMs 的 overrides：chatCompletion 里
+      // `const api = overrides || effectiveApi()` 是**整体替换**而非合并，
+      // 只给 timeoutMs 会让 baseUrl/apiKey/model 全变成 undefined，请求发不出去
+      // （表现为"折叠接口返回 202 但摘要永远是空的"）。跟随聊天模型就什么都不传。
+      return chatCompletion({ messages, temperature: 0.2 });
+    }
+    const providers = currentProviders();
+    const p = providers.find((x) => x.id === s.provider);
+    if (!p?.baseURL || !p?.apiKey || !s.model) {
+      throw new Error('摘要折叠专用模型未配置：请在设置 → 记忆 → 前情摘要里选择提供商与模型');
+    }
+    return chatCompletion({
+      messages,
+      temperature: 0.2,
+      // 专用模型必须给全 baseUrl/apiKey/model（overrides 是整体替换，缺一个都发不出去）
+      overrides: {
+        baseUrl: p.baseURL,
+        apiKey: p.apiKey,
+        model: s.model,
+        timeoutMs: Math.max(10000, Number(s.timeoutMs) || 180000)
+      }
+    });
   }
 
   /**
@@ -853,6 +994,10 @@ export class Orchestrator {
       : '';
 
     if (!targets.length) {
+      // 即使没人可整理也要记一次时间：自动整理是"每次运行后"都会进来问一遍的，
+      // 不记的话冷却永不生效 —— 每来一条消息就重扫 2000 条聊天记录，白烧 CPU
+      // （而结果每次都一样）。手动指定群友（only）不占用冷却。
+      if (!only) this.#markConsolidated(chatKey, []);
       return {
         ok: true,
         note: `没有可整理的群友${skippedNote || (only ? '（未指定有效群友）' : '（该群还没有任何群友印象，且聊天记录里没有发言足够多的活跃成员）')}`,

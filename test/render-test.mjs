@@ -226,6 +226,33 @@ try {
     console.log('  FAIL 语音分区抛错: ' + (e && e.message));
   }
 
+  // ── 记忆整理 / 前情摘要分区 ──
+  console.log('\n=== 记忆与前情摘要分区 ===');
+  try {
+    const memHtml = String(ctx.renderMemorySettingsSection(cfg));
+    const memNeeded = [
+      'settings-memory', 'cfg-mem-consolidate', 'cfg-mem-discover', 'cfg-mem-discovermax',
+      'cfg-mem-interval', 'settings-summary', 'cfg-sum-enabled', 'cfg-sum-keepraw',
+      'cfg-sum-maxchars', 'cfg-sum-minfold', 'cfg-sum-usechat',
+      'cfg-sum-model-pick', 'cfg-sum-provider', 'cfg-sum-model'
+    ];
+    const missMem = memNeeded.filter((id) => !memHtml.includes(id));
+    missMem.length === 0 ? pass++ : fail++;
+    console.log('  ' + (missMem.length === 0 ? 'OK   ' : 'FAIL ') + '记忆与摘要控件齐全'
+      + (missMem.length ? ' -> 缺 ' + missMem.join(', ') : ''));
+
+    // 「跟随聊天模型」时折叠模型选择框默认隐藏（两组都在 DOM 里，靠 JS 切显隐）
+    const c4 = JSON.parse(JSON.stringify(cfg));
+    c4.summary = { ...(c4.summary || {}), useChatModel: true };
+    const okSumHidden = String(ctx.renderMemorySettingsSection(c4))
+      .includes('id="sum-model-box" style="display:none"');
+    okSumHidden ? pass++ : fail++;
+    console.log('  ' + (okSumHidden ? 'OK   ' : 'FAIL ') + '跟随聊天模型时折叠模型选择框默认隐藏');
+  } catch (e) {
+    fail++;
+    console.log('  FAIL 记忆/摘要分区抛错: ' + (e && e.message));
+  }
+
   // 滑条换算函数
   console.log('\n=== 滑条换算（UI 侧）===');
   for (const fnName of ['sliderToTierUI', 'sliderToTierUI_tierToSlider', 'sliderDesc']) {
