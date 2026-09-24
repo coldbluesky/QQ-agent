@@ -24,7 +24,10 @@ function makeEl(id = '', cls = '') {
     checked: false,
     children: [],
     classList: null,
-    addEventListener() {},
+    // 记录事件处理器：让测试能"手动派发"事件，验证 handler 里的真实逻辑
+    // （只测"渲染不抛错"抓不到接线错误 —— 比如拿错 id、请求参数写错）。
+    _handlers: {},
+    addEventListener(type, fn) { (el._handlers[type] ||= []).push(fn); },
     removeEventListener() {},
     // 返回可用子元素而非 null —— 弹窗代码会拿它调 addEventListener。
     // ⚠️ 同一个 selector 必须返回**同一个**元素：updateUsagePage 用
@@ -757,6 +760,74 @@ try {
       bad ? fail++ : pass++;
       console.log('  ' + (bad ? 'FAIL ' : 'OK   ') + label + '页签可渲染'
         + (bad ? ' -> ' + (thrown || viewHtml.slice(0, 140)) : ' (' + viewHtml.length + ' 字符)'));
+    }
+
+    // ── 技能页「上传 zip 安装」的前端接线 ──
+    // 渲染不抛错 ≠ 接线正确：这里关心的是"选了文件之后前端到底发了什么请求、
+    // 提示了什么"，以及"非 zip 必须在本地就拦下、连请求都不发"。
+    // 这类错误（拿错 id、请求参数写错）只有真正驱动 handler 才会暴露。
+    console.log('\n  --- 上传 zip 安装（前端接线）---');
+    {
+      const skillsBox = document.querySelector('#skills-page');
+      await ctx.loadSkillsView(true);
+      const upInput = skillsBox.querySelector('#skills-upload-input');
+      const upBtn = skillsBox.querySelector('#skills-upload-btn');
+      const changeHandlers = (upInput._handlers && upInput._handlers.change) || [];
+      const changeFn = changeHandlers[changeHandlers.length - 1];
+      const okHandler = typeof changeFn === 'function';
+      okHandler ? pass++ : fail++;
+      console.log('  ' + (okHandler ? 'OK   ' : 'FAIL ') + '文件选择框绑定了 change 处理器');
+
+      const fetchBefore = sandbox.fetch;
+      const alertBefore = sandbox.alert;
+      const fetchCalls = [];
+      const uploadResp = {
+        ok: true, type: 'skill', dirName: 'demo-echo', dir: 'X:/skills/demo-echo', id: 'demo-echo',
+        installed: { id: 'demo-echo', name: '回声测试技能', enabled: false, active: false },
+        loadError: ''
+      };
+      let alerted = '';
+      sandbox.alert = (m) => { alerted = String(m); };
+      sandbox.fetch = async (url, options) => {
+        const u = String(url);
+        if (u.includes('/api/skills/upload')) {
+          fetchCalls.push({ url: u, method: options?.method, headers: options?.headers, body: options?.body });
+          return { ok: true, status: 200, json: async () => uploadResp };
+        }
+        return fetchBefore(url, options);
+      };
+      try {
+        // 1) 非 zip：必须本地拦下，不该发请求
+        upInput.files = [{ name: 'note.txt' }];
+        await changeFn();
+        const blocked = fetchCalls.length === 0 && alerted.includes('.zip');
+        blocked ? pass++ : fail++;
+        console.log('  ' + (blocked ? 'OK   ' : 'FAIL ') + '非 zip 文件被本地拦下（未发请求）'
+          + (blocked ? '' : ` -> calls=${fetchCalls.length} alert=${alerted}`));
+
+        // 2) zip：POST 二进制流到 /api/skills/upload，body 就是所选文件
+        alerted = '';
+        const fakeFile = { name: 'demo-echo.zip' };
+        upInput.files = [fakeFile];
+        await changeFn();
+        const call = fetchCalls[0];
+        const okReq = !!call && call.method === 'POST'
+          && String(call.headers?.['content-type'] || '').includes('octet-stream')
+          && call.body === fakeFile;
+        okReq ? pass++ : fail++;
+        console.log('  ' + (okReq ? 'OK   ' : 'FAIL ') + '以二进制流 POST /api/skills/upload（body 即所选文件）'
+          + (okReq ? '' : ` -> ${JSON.stringify({ method: call?.method, ct: call?.headers?.['content-type'], bodyIsFile: call?.body === fakeFile })}`));
+        const okMsg = alerted.includes('已安装') && alerted.includes('回声测试技能') && alerted.includes('关闭');
+        okMsg ? pass++ : fail++;
+        console.log('  ' + (okMsg ? 'OK   ' : 'FAIL ') + '提示已安装，并说明它默认是关闭的'
+          + (okMsg ? '' : ` -> ${alerted}`));
+        const okReset = upInput.value === '' && upBtn.disabled === false;
+        okReset ? pass++ : fail++;
+        console.log('  ' + (okReset ? 'OK   ' : 'FAIL ') + '上传后复位（清空所选文件、按钮可再次点击）');
+      } finally {
+        sandbox.fetch = fetchBefore;
+        sandbox.alert = alertBefore;
+      }
     }
     await memApp.stop();
   } catch (e) {

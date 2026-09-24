@@ -1766,6 +1766,111 @@ refs:
     pass('前情摘要：注入提示词且排在【过去状态】之前');
   }
 
+  // ── 上传 zip 安装技能（界面直传）──
+  // 覆盖整条链：真实 HTTP 路由 → 包结构校验 → 落盘 → 立刻重扫 → 类型判据。
+  // 技能系统此前没有任何端到端覆盖，这里至少把"传上去就能用"这条路跑通。
+  {
+    const base = `http://127.0.0.1:${cfg.server.port}`;
+
+    // 最小 zip 构造（stored 方式，不压缩）：只为走通上传解析，不追求压缩率。
+    // 读取端（zip-install.parseZip）只看中央目录 + 本地头，不校验 CRC，所以 CRC 填 0。
+    const makeZip = (files) => {
+      const chunks = [];
+      const central = [];
+      let offset = 0;
+      for (const f of files) {
+        const name = Buffer.from(f.name, 'utf8');
+        const data = Buffer.from(f.text, 'utf8');
+        const local = Buffer.alloc(30 + name.length);
+        local.writeUInt32LE(0x04034b50, 0);
+        local.writeUInt16LE(20, 4);
+        local.writeUInt16LE(0, 8);            // method = 0（stored）
+        local.writeUInt32LE(data.length, 18);
+        local.writeUInt32LE(data.length, 22);
+        local.writeUInt16LE(name.length, 26);
+        name.copy(local, 30);
+        chunks.push(local, data);
+
+        const cd = Buffer.alloc(46 + name.length);
+        cd.writeUInt32LE(0x02014b50, 0);
+        cd.writeUInt16LE(20, 4);
+        cd.writeUInt16LE(20, 6);
+        cd.writeUInt16LE(0, 10);              // method = 0
+        cd.writeUInt32LE(data.length, 20);
+        cd.writeUInt32LE(data.length, 24);
+        cd.writeUInt16LE(name.length, 28);
+        cd.writeUInt32LE(offset, 42);
+        name.copy(cd, 46);
+        central.push(cd);
+        offset += local.length + data.length;
+      }
+      const cdBuf = Buffer.concat(central);
+      const eocd = Buffer.alloc(22);
+      eocd.writeUInt32LE(0x06054b50, 0);
+      eocd.writeUInt16LE(files.length, 8);
+      eocd.writeUInt16LE(files.length, 10);
+      eocd.writeUInt32LE(cdBuf.length, 12);
+      eocd.writeUInt32LE(offset, 16);
+      return Buffer.concat([...chunks, cdBuf, eocd]);
+    };
+
+    const upload = (body) => fetch(`${base}/api/skills/upload`, {
+      method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body
+    });
+
+    // 1) 缺清单的包必须被拒，且**不落盘**（否则留下一个加载不起来的垃圾目录）
+    const r1 = await upload(makeZip([{ name: 'whatever/index.js', text: 'export function setup() {}' }]));
+    const d1 = await r1.json();
+    assert.strictEqual(r1.status, 400, '缺 skill.json/plugin.json 的包被拒绝');
+    assert.ok(String(d1.error || '').includes('skill.json'), `错误文案说清缺什么（实际：${d1.error}）`);
+    pass('上传安装：缺清单的包被拒绝（未落盘）');
+
+    // 2) 空内容
+    const r3 = await upload(Buffer.alloc(0));
+    assert.strictEqual(r3.status, 400, '空 body 被拒绝');
+    pass('上传安装：空内容被拒绝');
+
+    // 3) 合法包：上传 → 落盘 → 立刻重扫可见 → 删掉后不再出现
+    const uid = `upload-test-${Date.now().toString(36)}`;
+    const zip = makeZip([
+      {
+        name: `${uid}/skill.json`,
+        text: JSON.stringify({
+          id: uid, name: '上传测试技能', version: '1.0.0', apiVersion: 1,
+          category: 'utility', description: '自检用的临时技能', enabledByDefault: false,
+          capabilities: [], requires: [], settings: {}, configSchema: {}, prompt: null
+        }, null, 2)
+      },
+      {
+        name: `${uid}/index.js`,
+        text: 'export function setup(api) { api.registerTool({ id: \'noop\', name: \'空操作\', '
+          + 'description: \'测试用\', category: \'utility\', parameters: { type: \'object\', properties: {} }, '
+          + 'async execute() { return { content: \'ok\' }; } }); }'
+      }
+    ]);
+    const r2 = await upload(zip);
+    const d2 = await r2.json();
+    let installedDir = d2.dir || '';
+    try {
+      assert.strictEqual(r2.status, 200, `上传成功（HTTP ${r2.status} ${d2.error || ''}）`);
+      assert.strictEqual(d2.type, 'skill', 'skill.json → skills/（与口令安装同一判据）');
+      assert.ok(!d2.loadError, `加载无错（${d2.loadError || ''}）`);
+      assert.ok(d2.installed && d2.installed.id === uid, '重扫后立刻能在列表里查到它');
+      assert.ok(fs.existsSync(path.join(installedDir, 'skill.json')), '清单文件真的落盘了');
+      assert.ok(fs.existsSync(path.join(installedDir, 'index.js')), '代码文件真的落盘了');
+      const listed = await (await fetch(`${base}/api/skills`)).json();
+      assert.ok((listed.skills || []).some((s) => s.id === uid), '/api/skills 能看到它');
+      pass('上传安装：合法包落盘 + 立刻重扫可见', `id=${uid}`);
+    } finally {
+      // 这是往真实仓库的 skills/ 写文件，无论断言是否通过都要删干净并重扫
+      try { fs.rmSync(installedDir, { recursive: true, force: true }); } catch { /* ignore */ }
+      await fetch(`${base}/api/skills/reload`, { method: 'POST' }).catch(() => {});
+    }
+    const after = await (await fetch(`${base}/api/skills`)).json();
+    assert.ok(!(after.skills || []).some((s) => s.id === uid), '删除后重扫，列表里不再有它（测试不留垃圾）');
+    pass('上传安装：删除后重扫不再出现（不留残留）');
+  }
+
   // ── 收尾 ──
   await app.stop();
   onebotWs.close();

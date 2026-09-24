@@ -6258,8 +6258,13 @@ function renderSkillsView(box, data, avail) {
         共 ${summary.total ?? skills.length} 项：运行中 ${summary.active ?? 0} · 已停用 ${summary.disabled ?? 0}${summary.broken ? ` · 异常 ${summary.broken}` : ''}
         ｜工具 ${tools.length} 个${disabledTools.length ? `（${disabledTools.length} 个当前不可用）` : ''}
       </div>
-      <button class="btn btn-small" id="skills-reload">重扫磁盘</button>
+      <div class="skill-actions">
+        <button class="btn btn-small" id="skills-upload-btn"
+          title="上传技能/插件 zip 安装包。包根目录需带 skill.json（→ skills/）或 plugin.json（→ plugins/）">上传 zip 安装</button>
+        <button class="btn btn-small" id="skills-reload">重扫磁盘</button>
+      </div>
     </div>
+    <input type="file" id="skills-upload-input" accept=".zip,application/zip" style="display:none" />
     <div class="skills-list">${rows || '<div class="empty-hint">skills/ 与 plugins/ 目录为空</div>'}</div>
     <details class="skills-tools">
       <summary>工具可用性（${tools.length}）</summary>
@@ -6271,6 +6276,50 @@ function renderSkillsView(box, data, avail) {
 
   box.querySelector('#skills-reload')?.addEventListener('click', async () => {
     try { await api('/api/skills/reload', { method: 'POST' }); } catch { /* 下面统一重拉 */ }
+    box.dataset.loaded = '0';
+    await loadSkillsView(true);
+  });
+  // ── 上传 zip 安装 ──
+  // 选包 → 直传原始字节 → 后端校验 / 落地 / 立刻重扫。
+  // 与市场"口令安装"共用同一套 zip-install（路径穿越、可执行后缀、解压超量都有闸），
+  // 所以界面上传和口令安装不会出现两套安全标准。
+  const uploadInput = box.querySelector('#skills-upload-input');
+  box.querySelector('#skills-upload-btn')?.addEventListener('click', () => {
+    if (typeof uploadInput?.click === 'function') uploadInput.click();
+  });
+  uploadInput?.addEventListener('change', async () => {
+    const file = uploadInput.files && uploadInput.files[0];
+    if (!file) return;
+    if (!/\.zip$/i.test(String(file.name || ''))) {
+      alert('请选择 .zip 安装包（把 skill.json 或 plugin.json 放在包根目录后再压缩）');
+      uploadInput.value = '';
+      return;
+    }
+    const btn = box.querySelector('#skills-upload-btn');
+    const oldText = btn ? btn.textContent : '';
+    if (btn) { btn.disabled = true; btn.textContent = '上传中…'; }
+    try {
+      // 不能走 api() 的默认 JSON 头 —— body 是文件本身，不是 JSON。
+      const r = await api('/api/skills/upload', {
+        method: 'POST',
+        headers: { 'content-type': 'application/octet-stream' },
+        body: file
+      });
+      const kindLabel = r.type === 'plugin' ? '插件' : '技能';
+      if (r.loadError) {
+        // 文件确实写进去了，但没跑起来 —— 必须说清楚，否则用户以为装好了
+        alert(`已写入 ${kindLabel} ${r.dirName}，但加载失败：\n${r.loadError}\n\n文件位置：${r.dir}`);
+      } else if (r.installed && r.installed.enabled === false) {
+        alert(`已安装${kindLabel}：${r.installed.name || r.id}\n它当前是关闭状态，在列表里打开开关即可使用。`);
+      } else {
+        alert(`已安装${kindLabel}：${r.installed?.name || r.id}`);
+      }
+    } catch (error) {
+      alert(`上传失败：${error?.message ?? error}`);
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = oldText || '上传 zip 安装'; }
+      uploadInput.value = '';   // 清掉选择，同一个包改过之后还能再传一次
+    }
     box.dataset.loaded = '0';
     await loadSkillsView(true);
   });
