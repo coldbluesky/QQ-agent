@@ -318,6 +318,11 @@ function renderBanner() {
   } else if (s && !s.onebot.connected && !s.onebot.everConnected) {
     show = true;
     html = '🔌 OneBot（SnowLuma）还没连上：请确认 SnowLuma 已启动，且设置里的 WS/HTTP 地址正确。';
+  } else if (s?.onebot?.connected
+    && Number(s.onebot.health?.silentMs) > Math.max(20000, Number(s.onebot.health?.heartbeatIntervalMs) * 3)) {
+    // 连着呢、却长时间收不到任何事件 —— 这是"消息收不到"的典型形态
+    show = true;
+    html = '🔌 OneBot 连接疑似假死（长时间收不到任何事件），消息可能收不到。程序已在尝试自动重连；若持续如此，请到 SnowLuma 页签检查协议端是否正常。';
   }
   banner.classList.toggle('hidden', !show);
   if (show) {
@@ -369,10 +374,29 @@ async function refreshStatus() {
     const s = state.status;
     const dot = $('#onebot-dot');
     const label = $('#onebot-label');
-    dot.className = 'dot ' + (s.onebot.connected ? 'dot-on' : (s.onebot.everConnected ? 'dot-wait' : 'dot-off'));
-    label.textContent = s.onebot.connected
-      ? `OneBot 已连接${s.onebot.self ? `（${s.onebot.self.nickname}）` : ''}`
-      : 'OneBot 未连接';
+    // 连接健康度：半开连接（TCP 还连着、对端已不推事件）以前完全看不出来 ——
+    // 状态栏永远显示"已连接"，可消息早就收不到了。这里用"多久没收到任何事件"
+    // 把它标出来，阈值与后端的看门狗一致（心跳间隔的 3 倍，最少 20 秒）。
+    const h = s.onebot.health || {};
+    const silentMs = Number(h.silentMs) || 0;
+    const hbMs = Number(h.heartbeatIntervalMs) || 0;
+    const stale = s.onebot.connected && silentMs > Math.max(20000, hbMs * 3);
+    dot.className = 'dot ' + (!s.onebot.connected
+      ? (s.onebot.everConnected ? 'dot-wait' : 'dot-off')
+      : (stale ? 'dot-wait' : 'dot-on'));
+    label.textContent = !s.onebot.connected
+      ? 'OneBot 未连接'
+      : (stale
+        ? `OneBot 连接疑似假死（${Math.round(silentMs / 1000)}s 无事件）`
+        : `OneBot 已连接${s.onebot.self ? `（${s.onebot.self.nickname}）` : ''}`);
+    // 悬停看细节：多久没事件、心跳间隔、因假死自动重连过几次
+    label.title = s.onebot.connected
+      ? [
+        `最近事件：${silentMs > 0 ? `${Math.round(silentMs / 1000)} 秒前` : '未知'}`,
+        `心跳间隔：${hbMs > 0 ? `${hbMs} ms` : '未收到心跳事件（无法检测假死）'}`,
+        `自动重连：${h.revives || 0} 次`
+      ].join('\n')
+      : '';
     $('#model-label').textContent = `模型：${s.orchestrator.model || '未设置'}`;
     const u = s.usage;
     // 成本：官方价匹配得上就显示；匹配不上（中转站常见）只显示 token，不显示误导性的 ¥0

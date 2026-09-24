@@ -6,6 +6,28 @@ import { sanitizeUserText, escapeCqText } from './util.js';
 const RECONNECT_MIN_MS = 3000;
 const RECONNECT_MAX_MS = 30000;
 
+// ── 连接假死检测（看门狗）──
+// WS 半开时（TCP 还连着、对端已经不推事件了）不会触发 close/error，
+// 客户端会一直以为自己连着、UI 也显示"已连接"，但消息永远收不到 —— 而且没有任何东西会救它。
+// 判断依据是协议端自己的心跳：连接活着就一定会持续收到，静默远超心跳间隔即为已死。
+const WATCHDOG_TICK_MS = 5000;
+const WATCHDOG_MIN_SILENCE_MS = 20000;      // 静默阈值下限（心跳间隔很小时兜底）
+const WATCHDOG_QUIET_WARN_MS = 300000;      // 没心跳时多久提示一次"无法检测"
+
+/**
+ * 是否该判定"连接已假死"（纯函数，便于单测）。
+ *
+ * 关键取舍：**没见过心跳时一律返回 false**。静默本身不等于故障 ——
+ * 群里没人说话的深夜本来就没有消息，误判会导致反复重连，而重连窗口里
+ * 进来的消息是真会丢的。所以只在"协议端自己在持续发心跳、却突然不发了"时
+ * 才认定假死。
+ */
+export function isConnectionStale({ silentMs, heartbeatIntervalMs, minSilenceMs = WATCHDOG_MIN_SILENCE_MS } = {}) {
+  const hb = Number(heartbeatIntervalMs) || 0;
+  if (hb <= 0) return false;
+  return Number(silentMs) > Math.max(Number(minSilenceMs) || WATCHDOG_MIN_SILENCE_MS, hb * 3);
+}
+
 export class OneBotClient {
   constructor({ wsUrl, httpUrl, accessToken, httpToken, onEvent }) {
     this.wsUrl = String(wsUrl || 'ws://127.0.0.1:3001');
@@ -21,9 +43,68 @@ export class OneBotClient {
     this.selfInfo = null;      // { user_id, nickname }
     this.#closedByUs = false;
     this.statusListeners = new Set();
+    // 连接健康度（排查"消息收不到"用）
+    this.lastEventAt = 0;          // 最近一次收到 WS 事件（含心跳）的时间
+    this.heartbeatIntervalMs = 0;  // 协议端上报的心跳间隔；0 = 还没见过心跳
+    this.revives = 0;              // 因疑似假死而主动重连的次数
+    this.lastReviveAt = 0;
+    this.watchdog = null;
   }
 
   #closedByUs;
+  #warnedNoHeartbeat = false;
+
+  /**
+   * 连接健康度快照（给 /api/status 与 UI 用）。
+   * silentMs 是"距上次收到任何事件过了多久"—— 这个数字在暴涨时就是出问题的信号。
+   */
+  get health() {
+    return {
+      lastEventAt: this.lastEventAt || null,
+      silentMs: this.lastEventAt ? Date.now() - this.lastEventAt : null,
+      heartbeatIntervalMs: this.heartbeatIntervalMs || null,
+      revives: this.revives,
+      lastReviveAt: this.lastReviveAt || null
+    };
+  }
+
+  /**
+   * 启动看门狗。判断逻辑：
+   *   - 见过心跳 → 静默超过 max(20s, 3×心跳间隔) 就判定假死，主动重连；
+   *   - 没见过心跳 → **不做判断**，只提示一次。
+   *     因为静默本身不等于故障：群里没人说话的深夜本来就没有消息，
+   *     误判会导致反复重连，而重连窗口里进来的消息是真会丢的。
+   */
+  #startWatchdog() {
+    if (this.watchdog) return;
+    this.watchdog = setInterval(() => {
+      if (!this.connected || this.#closedByUs) return;
+      const last = this.lastEventAt;
+      if (!last) return;
+      const silent = Date.now() - last;
+      if (this.heartbeatIntervalMs > 0) {
+        if (isConnectionStale({ silentMs: silent, heartbeatIntervalMs: this.heartbeatIntervalMs })) {
+          this.revives += 1;
+          this.lastReviveAt = Date.now();
+          console.warn(
+            `[onebot] 连接疑似假死：${Math.round(silent / 1000)}s 未收到任何事件`
+            + `（心跳间隔 ${this.heartbeatIntervalMs}ms），主动重连（累计第 ${this.revives} 次）`
+          );
+          this.reconnect();
+        }
+      } else if (!this.#warnedNoHeartbeat && silent > WATCHDOG_QUIET_WARN_MS) {
+        this.#warnedNoHeartbeat = true;
+        console.warn('[onebot] 已 5 分钟未收到任何事件，且从未收到心跳事件 —— 无法检测连接假死，建议在协议端开启 heartbeat');
+      }
+    }, WATCHDOG_TICK_MS);
+    if (this.watchdog.unref) this.watchdog.unref();   // 别拖住进程退出
+  }
+
+  #stopWatchdog() {
+    if (!this.watchdog) return;
+    clearInterval(this.watchdog);
+    this.watchdog = null;
+  }
 
   onStatus(fn) {
     this.statusListeners.add(fn);
@@ -41,6 +122,7 @@ export class OneBotClient {
   async connect() {
     this.#closedByUs = false;
     this.#connectLoop();
+    this.#startWatchdog();
   }
 
   /** 连接配置可能变了（比如从 SnowLuma 配置同步到了新令牌），重连一次。 */
@@ -77,6 +159,10 @@ export class OneBotClient {
     socket.on('open', async () => {
       if (!isCurrent(socket)) return;
       this.lastConnectError = '';
+      // 重置存活信号：断线期间累积的静默不该算到新连接头上；
+      // 心跳间隔也重新学（对端可能改过配置），否则会拿旧值误判、反复重连。
+      this.lastEventAt = Date.now();
+      this.heartbeatIntervalMs = 0;
       this.#setStatus(true);
       try {
         this.selfInfo = await this.call('get_login_info');
@@ -86,9 +172,17 @@ export class OneBotClient {
     });
     socket.on('message', (data) => {
       if (!isCurrent(socket)) return;
+      this.lastEventAt = Date.now();
       let event = null;
       try { event = JSON.parse(String(data)); } catch { return; }
       if (!event || typeof event !== 'object') return;
+      // 心跳：记下协议端上报的间隔，看门狗用它判断"多久没动静才算死了"。
+      // 心跳本身不用往上送 —— 没有任何处理器关心它。
+      if (event.post_type === 'meta_event' && event.meta_event_type === 'heartbeat') {
+        const iv = Number(event.interval);
+        if (Number.isFinite(iv) && iv > 0) this.heartbeatIntervalMs = iv;
+        return;
+      }
       try { this.onEvent(event); } catch (error) { console.error('[onebot] 事件处理出错:', error); }
     });
     socket.on('close', () => {
@@ -108,6 +202,7 @@ export class OneBotClient {
 
   close() {
     this.#closedByUs = true;
+    this.#stopWatchdog();
     const old = this.socket;
     this.socket = null;
     try { old?.close(); } catch { /* ignore */ }

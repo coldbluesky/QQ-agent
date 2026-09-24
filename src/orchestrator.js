@@ -186,6 +186,25 @@ export class Orchestrator {
     });
   }
 
+  /**
+   * 运行收尾时检查是否还有未读：有就稍后再开一次会话（drain）。
+   *
+   * 这是"运行期间来的消息不会丢"的关键一环：onIncoming 在运行中会直接返回、
+   * 把责任交给这里（见 onIncoming 的注释）。所以它必须**无条件执行**，
+   * 因此被放进 #runAgent 的 finally，并且内部自己兜住异常 ——
+   * 收尾清理绝不能因为"调度 drain 失败"而中断。
+   */
+  #scheduleDrainIfUnread(chatKey) {
+    try {
+      if (this.aborted || this.paused) return;
+      if (this.store.unreadCount(chatKey) <= 0) return;
+      const drainDelay = Math.max(200, Number(getConfig().drainDelayMs) || 1200);
+      this.scheduleWake(chatKey, drainDelay);
+    } catch (error) {
+      console.error(`[orchestrator] ${chatKey} drain 调度失败:`, error?.message ?? error);
+    }
+  }
+
   #finishWaiting(sessionId, status, error = '') {
     if (!sessionId) return;
     const s = this.sessions.current.get(sessionId);
@@ -207,7 +226,15 @@ export class Orchestrator {
   async wake(chatKey, { proactive = false, waitingSessionId = null } = {}) {
     if (this.aborted) { if (waitingSessionId) this.#finishWaiting(waitingSessionId, 'aborted'); return; }
     if (this.paused && !proactive) { if (waitingSessionId) this.#finishWaiting(waitingSessionId, 'aborted'); return; }
-    if (this.runningChats.has(chatKey)) return;
+    if (this.runningChats.has(chatKey)) {
+      // 这次唤醒被合并，交给正在跑的那次运行收尾时的 drain（见 #scheduleDrainIfUnread）。
+      // 主动开话题本来就是"能跳就跳"，不算异常不记日志；其它来源记一条，
+      // 便于排查"消息进来了却没反应"（正常情况不该频繁出现）。
+      if (!proactive) {
+        console.warn(`[orchestrator] ${chatKey} 正在运行，本次唤醒被合并（未读将由收尾 drain 接管）`);
+      }
+      return;
+    }
 
     // 模型未设置：不产生报错会话，消息保留为未读；设置模型后（下一条消息或手动唤醒）自动补处理
     if (!String(getConfig().api.model || '').trim()) {
@@ -364,15 +391,12 @@ export class Orchestrator {
       this.activeRuns.delete(chatKey);
       this.runningChats.delete(chatKey);
       this.emit('chat-update', chatKey);
-    }
-
-    // drain：运行期间来的新消息 → 再次新开会话处理（这是"确保看到所有发言"的关键）
-    if (!this.aborted && !this.paused) {
-      const unread = this.store.unreadCount(chatKey);
-      if (unread > 0) {
-        const drainDelay = Math.max(200, Number(getConfig().drainDelayMs) || 1200);
-        this.scheduleWake(chatKey, drainDelay);
-      }
+      // ⚠️ drain 必须在 finally 里，不能放到 try/finally 之后。
+      // 原先它在外面，一旦这段里抛出任何异常（finish / emit / resetSessionForRetry
+      // 都可能抛），drain 会被整段跳过 —— 未读消息留在存档里、却再没有任何人安排唤醒，
+      // 只能等用户"再发一条"才把它带出来。这正是"消息进来了却没反应、重新提醒才行"
+      // 的成因之一（onIncoming 在运行中会把唤醒交给 drain，drain 一丢就没人管了）。
+      this.#scheduleDrainIfUnread(chatKey);
     }
 
     // 记忆自动整理（后台静默，绝不阻塞/影响聊天主流程）

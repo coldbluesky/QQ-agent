@@ -745,7 +745,10 @@ export function createApp({ log = console.log } = {}) {
             connected: onebot.connected,
             everConnected: onebot.everConnected,
             error: onebot.lastConnectError,
-            self: onebot.selfInfo ? { userId: onebot.selfId, nickname: onebot.selfNickname } : null
+            self: onebot.selfInfo ? { userId: onebot.selfId, nickname: onebot.selfNickname } : null,
+            // 连接健康度：silentMs 暴涨 = 连接可能已假死（界面上会直接标出来）。
+            // 有了它，"连着呢但收不到消息"这种事才看得见 —— 否则状态栏永远是"已连接"。
+            health: onebot.health
           },
           snowluma: {
             dir: snowlumaDir(),

@@ -1623,12 +1623,64 @@ refs:
       return n >= 2 ? n : null;
     }, 15000, '零印象的新群自动发现活跃群友并调用模型');
     assert.ok(extra >= 2, `运行结束后应额外发生一次整理调用（实际只多 ${extra - 1} 次）`);
-    const memCall = llm.state.requests.find(
+    // ⚠️ 必须"等"这次调用出现，不能取一次就断言：自动整理是后台异步的，
+    // 前面的 extra>=2 成立时它可能还没发出去（整理内部还要读聊天记录、写记忆文件）。
+    const memCall = await waitFor(() => llm.state.requests.find(
       (r) => String(r.messages?.[0]?.content || '').includes('记忆模块')
         && String(r.messages?.[1]?.content || '').includes('556')
-    );
+    ), 15000, '为 556 发起"提炼长期印象"的调用');
     assert.ok(memCall, '这次自动整理确实是为 556 发起"提炼长期印象"');
     pass('群友印象：零印象的群也能自动发现活跃成员（旧逻辑因"印象数不超阈值"完全不触发）');
+  }
+
+  // ── 场景 40a：OneBot 连接的存活信号（心跳）──
+  // 半开连接（TCP 还连着、对端已不再推事件）不会触发 close/error：客户端会一直以为自己
+  // 连着、界面也显示"已连接"，但消息永远收不到，而且没有任何东西会去救它。
+  // 唯一可靠的判断依据是协议端自己的心跳 —— 所以必须真的把它接住。
+  {
+    const ob = await import('../src/onebot.js');
+    assert.strictEqual(ob.isConnectionStale({ silentMs: 5000, heartbeatIntervalMs: 5000 }), false, '心跳正常时不算假死');
+    assert.strictEqual(ob.isConnectionStale({ silentMs: 25000, heartbeatIntervalMs: 5000 }), true, '静默远超心跳间隔即判假死');
+    assert.strictEqual(ob.isConnectionStale({ silentMs: 19000, heartbeatIntervalMs: 5000 }), false, '静默在 20 秒下限内不判假死');
+    assert.strictEqual(ob.isConnectionStale({ silentMs: 40000, heartbeatIntervalMs: 60000 }), false,
+      '心跳间隔很长时按 3 倍间隔算，40 秒静默不该误判');
+    assert.strictEqual(ob.isConnectionStale({ silentMs: 3600000, heartbeatIntervalMs: 0 }), false,
+      '从未收到心跳时不判假死（静默 ≠ 故障，避免深夜空闲被误判成假死而反复重连丢消息）');
+
+    const reqsBefore = llm.state.requests.length;
+    const sessionsBefore = app.sessions.listSummaries(60).length;
+    onebotWs.push({ post_type: 'meta_event', meta_event_type: 'heartbeat', interval: 5000, status: { online: true } });
+    await waitFor(() => app.onebot.heartbeatIntervalMs === 5000, 5000, '心跳间隔被记录');
+    assert.strictEqual(app.onebot.health.heartbeatIntervalMs, 5000, 'health 快照带出心跳间隔');
+    assert.ok(
+      app.onebot.health.silentMs !== null && app.onebot.health.silentMs < 5000,
+      `health 应带出"距上次收到事件"的毫秒数（实际 ${app.onebot.health.silentMs}）`
+    );
+    await sleep(300);
+    assert.strictEqual(llm.state.requests.length, reqsBefore, '心跳不该触发任何模型调用');
+    assert.strictEqual(app.sessions.listSummaries(60).length, sessionsBefore, '心跳不该产生会话');
+    pass('OneBot 存活信号：心跳被接住、用于假死判定，且不打扰业务');
+  }
+
+  // ── 场景 40b：运行失败也不能让消息搁浅 ──
+  // 失败路径最容易漏掉的收尾动作就是 drain：一旦漏掉，运行期间到达的消息会一直留在
+  // "未读"里、没有任何人安排唤醒，只能等用户再发一条才被带出来
+  // （onIncoming 在运行中会把责任交给 drain，drain 丢了这个责任就没人接了）。
+  {
+    const idx = llm.state.requests.length;
+    const later = '失败之后的新消息';
+    // ⚠️ 要 9 个 500：chatCompletionWithRetry 单次会话内最多重试 3 次，会话级又有 3 次尝试，
+    // 3×3 才能把整轮彻底打垮。只给 3 个的话第 4 个请求就落到正常脚本上，
+    // 会话会变成"跑通了但没发言"（noreply），断言 error 会失败。
+    llm.state.forceStatus = new Array(9).fill(500);
+    llm.state.script[idx + 9] = { content: '（收到，不回）' };    // 前面全部失败，第 10 个是收尾 drain 运行
+    pushGroupMsg(117, '阿七', '这条会失败', 9910);
+    await sleep(700);                                          // 让失败会话进入重试退避
+    pushGroupMsg(118, '阿八', later, 9911);                     // ← 失败期间到达的消息
+    const failed = await waitSessionDone('这条会失败', 60000);
+    assert.strictEqual(failed.status, 'error', `连续失败后会话应记为 error（实际 ${failed.status}）`);
+    await waitSessionDone(later, 30000);
+    pass('运行失败不搁浅：收尾 drain 仍会处理失败期间到达的消息');
   }
 
   // ── 场景 41：前情摘要（跨会话的对话记忆）──
