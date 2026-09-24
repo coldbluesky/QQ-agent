@@ -187,21 +187,20 @@ export class OneBotClient {
   /**
    * 发送语音（OneBot record 段）。
    *
-   * file 支持三种形态，但本项目只产出本地绝对路径（见 tts.js）——那是最稳的一种：
-   *   - 本地绝对路径：D:/.../data/voice/xxx.mp3（这里会统一成正斜杠，Windows 反斜杠
-   *     在部分协议端会被当成转义符吃掉）
-   *   - http(s) URL
-   *   - base64://...
+   * file 必须是协议端能识别的形式：http(s):// / base64:// / file://。
+   * ⚠️ 传裸绝对路径会被 NapCat 系当成 URL 解析并报 "识别URL失败" ——
+   * 调用方请先过 tts.js 的 voiceFileParam()，别直接把文件路径塞进来。
    *
    * 注：QQ 原生要求 silk，SnowLuma/NapCat 在有 ffmpeg 时会自动把 mp3 转码；
-   * 转不了就会发出去放不响，此时把 voice.format 换成 opus/wav 再试。
+   * 转不了就会发出去放不响，此时把 voice.format 换成 wav 再试。
    */
   async sendRecord(kind, id, file, options = {}) {
     const target = String(file ?? '').trim();
     if (!target) throw new Error('语音文件不能为空');
-    // 只对本地路径做斜杠归一化；URL / base64 原样透传
-    const normalized = /^(https?:|base64:|file:)/i.test(target) ? target : target.replace(/\\/g, '/');
-    const segments = [...this.#head(options), { type: 'record', data: { file: normalized } }];
+    if (!/^(https?:|base64:|file:)/i.test(target)) {
+      throw new Error(`语音文件必须以 http(s):// / base64:// / file:// 开头（收到：${target.slice(0, 80)}）`);
+    }
+    const segments = [...this.#head(options), { type: 'record', data: { file: target } }];
     return this.sendSegments(kind, id, segments);
   }
 

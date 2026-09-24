@@ -2988,6 +2988,15 @@ function renderVoiceSection(c) {
       <div class="field"><label>语速（1 = 原速）</label>
         <input type="number" id="cfg-voice-speed" step="0.05" min="0.25" max="4" value="${esc(c.voice?.speed ?? 1)}" /></div>
     </div>
+    <div class="field"><label>交给协议端的形式</label>
+      <select id="cfg-voice-filemode">
+        ${[
+      ['file-uri', 'file:// 本地路径 URI（默认，NapCat 系推荐）'],
+      ['path', '裸绝对路径（个别老实现）'],
+      ['base64', 'base64 内联（协议端在 Docker / 与机器人不同机时选它）']
+    ].map(([v, label]) => `<option value="${v}" ${(c.voice?.fileMode || 'file-uri') === v ? 'selected' : ''}>${esc(label)}</option>`).join('')}
+      </select>
+      <div class="hint">OneBot 的 record 段只认带协议头的形式；传裸路径会被当成 URL 解析并报「识别URL失败」，所以默认用 <code>file://</code>。协议端看不到这个文件路径时（容器隔离/跨机部署）改选 base64。</div></div>
     <div class="field-row">
       <div class="field"><label>单条语音最长字数</label>
         <input type="number" id="cfg-voice-maxchars" min="1" max="500" value="${esc(c.voice?.maxChars ?? 200)}" />
@@ -4869,6 +4878,7 @@ async function saveConfig({ quiet = false } = {}) {
       model: val('#cfg-voice-model', c.voice?.model || '').trim(),
       voice: val('#cfg-voice-name', c.voice?.voice || 'alloy').trim() || 'alloy',
       format: val('#cfg-voice-format', c.voice?.format || 'mp3'),
+      fileMode: val('#cfg-voice-filemode', c.voice?.fileMode || 'file-uri'),
       speed: Number(val('#cfg-voice-speed', c.voice?.speed ?? 1)) || 1,
       maxChars: Math.max(1, Number(val('#cfg-voice-maxchars', c.voice?.maxChars ?? 200)) || 200),
       keepFiles: Math.max(0, Number(val('#cfg-voice-keepfiles', c.voice?.keepFiles ?? 100)) || 0),

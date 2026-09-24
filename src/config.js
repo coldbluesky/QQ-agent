@@ -55,7 +55,13 @@ export const DEFAULT_CONFIG = {
     instructions: '',        // 可选：风格指令（gpt-4o-mini-tts 这类模型支持）
     // ── 两种模式共用 ──
     format: 'mp3',           // 输出格式：mp3 | opus | aac | flac | wav | pcm（腾讯云只支持 mp3/wav/pcm）
-    speed: 1,                // 语速倍率，1 = 原速（腾讯云模式下会折算成其 [-2,6] 的 Speed 值，有效范围 0.6x~2.5x）
+    // 语音文件以什么形式交给协议端（OneBot record 段的 file 字段）。
+    //   file-uri = file:///opt/... 形式的本地路径 URI（默认；NapCat 系只认带协议头的形式，
+    //              裸绝对路径会被当成 URL 解析，报 "识别URL失败"）
+    //   path     = 裸绝对路径（个别老实现只认这个）
+    //   base64   = base64:// 内联音频（协议端在 Docker 里、或与机器人不同机时最稳：
+    //              不依赖双方能看到同一个文件路径，代价是消息体积变大）
+    fileMode: 'file-uri',
     maxChars: 200,           // 单条语音最长字符数，超出截断（防止模型念长文）
     timeoutMs: 60000,
     keepFiles: 100,          // data/voice/ 本地语音文件保留个数；**0 = 不限制**

@@ -445,6 +445,35 @@ async function synthesizeTencent(input, overrides) {
   };
 }
 
+/**
+ * 把本地音频文件转成协议端能识别的 file 参数（OneBot record 段的 file 字段）。
+ *
+ * 为什么不能直接传路径：NapCat 系协议端（SnowLuma 也是基于它）对 file 是按前缀分派的，
+ * 只认 http(s):// / base64:// / file:// 三种。传裸绝对路径会走进 URL 解析分支并报
+ * "识别URL失败" —— 这正是 Windows 上没暴露（试听不经过 OneBot）、一上 Linux 就炸的原因。
+ *
+ * base64 模式的价值在跨容器/跨机器部署：协议端在 Docker 里时看不到宿主机的
+ * /opt/qq-agent/data/...，走路径必然失败；内联数据则与文件系统无关。
+ */
+export function voiceFileParam(filePath) {
+  const raw = String(filePath || '').trim();
+  if (!raw) throw new Error('语音文件路径为空');
+  // 已经是完整形式（URL / base64 / file URI）就原样透传，只做斜杠归一化
+  if (/^(https?:|base64:|file:)/i.test(raw)) return raw.replace(/\\/g, '/');
+
+  const local = raw.replace(/\\/g, '/');
+  const mode = String(getConfig().voice?.fileMode || 'file-uri');
+  if (mode === 'path') return local;
+  if (mode === 'base64') {
+    const buffer = fs.readFileSync(filePath);
+    if (!buffer.length) throw new Error('语音文件为空，无法内联');
+    return `base64://${buffer.toString('base64')}`;
+  }
+  // POSIX 的 /opt/x.mp3 → file:///opt/x.mp3（三斜杠）
+  // Windows 的 D:/x.mp3 → file:///D:/x.mp3
+  return local.startsWith('/') ? `file://${local}` : `file:///${local}`;
+}
+
 /** 按保留个数清理旧语音文件（keepFiles<=0 表示不限制，直接跳过）。 */
 function pruneVoiceFiles(keepRaw) {
   const keep = Number(keepRaw);

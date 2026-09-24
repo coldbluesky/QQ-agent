@@ -6,6 +6,8 @@
 import { getConfig, DEFAULT_CONFIG } from './config.js';
 import { sleep, randInt, createSendChain, escapeCqText, formatClockTime } from './util.js';
 import { mdToPlain, splitForQQ } from './md-to-plain.js';
+// 音频文件要转成协议端认识的形式（file:// URI / 裸路径 / base64）才能发
+import { voiceFileParam } from './tts.js';
 
 // 限频回退值统一取自 DEFAULT_CONFIG，杜绝"代码默认 80 / 回退值 8 / UI 回退 8"三处打架。
 const DEFAULT_MAX_PER_MINUTE = DEFAULT_CONFIG.send.maxPerMinute;
@@ -146,7 +148,7 @@ export class SendQueue {
     return chain(async () => {
       this.#checkRate(chatKey);
       await sleep(randInt(800, 1600));   // 语音比文字更"重"，真人式的停顿给足
-      const data = await this.onebot.sendRecord(kind, id, voice?.file, {
+      const data = await this.onebot.sendRecord(kind, id, voiceFileParam(voice?.file), {
         replyToMessageId: options.replyToMessageId ?? null,
         atUserId: options.atUserId ?? null
       });
