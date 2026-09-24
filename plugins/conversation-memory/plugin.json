@@ -1,0 +1,87 @@
+{
+  "id": "conversation-memory",
+  "name": "分层会话记忆",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "category": "knowledge",
+  "description": "把聊天压缩成日块索引，让模型能回忆很久以前的事。平常不进提示词、不花 token，问旧事才检索。",
+  "author": "QQ Agent",
+  "enabledByDefault": true,
+  "capabilities": [
+    "memory.search",
+    "memory.archive",
+    "memory.status"
+  ],
+  "requires": [],
+  "settings": {
+    "enabled": true,
+    "injectArchitecture": true,
+    "consolidateIntervalMin": 10,
+    "pendingTodos": true,
+    "crossTurnWorking": true,
+    "semanticCards": true,
+    "crossChatAwareness": true,
+    "semanticTopN": 2,
+    "costGuard": true,
+    "dayPromptMax": 800000,
+    "chatPromptMax": 200000
+  },
+  "configSchema": {
+    "enabled": {
+      "type": "boolean",
+      "label": "启用会话记忆",
+      "description": "关掉后不再巩固、不再注入；已生成的索引留在磁盘上不会删。检索工具也会随之不可用（技能页会显示「依赖未就绪」）。"
+    },
+    "injectArchitecture": {
+      "type": "boolean",
+      "label": "注入短记忆片段",
+      "description": "每轮往提示词里加一小段（待办 / 跨轮 / 语义卡 / 跨群），量很小。关掉就只剩「模型主动检索」这一条路。"
+    },
+    "consolidateIntervalMin": {
+      "type": "number",
+      "label": "巩固间隔（分钟）",
+      "description": "后台把新消息压成日块的间隔，默认 10 分钟。只在有新增时才写盘。"
+    },
+    "pendingTodos": {
+      "type": "boolean",
+      "label": "待办提醒",
+      "description": "模型说「记着明天问一下」这类待办，到期自动消失，不靠模型每次维护。"
+    },
+    "crossTurnWorking": {
+      "type": "boolean",
+      "label": "跨轮工作记忆",
+      "description": "记住上一轮想到哪了、刚发过什么，避免复读。TTL 内有效。"
+    },
+    "semanticCards": {
+      "type": "boolean",
+      "label": "语义卡片",
+      "description": "本地启发式从聊天里抽「约好/喜欢/雷点」这类长期常识，命中才注入。"
+    },
+    "crossChatAwareness": {
+      "type": "boolean",
+      "label": "跨会话旁听",
+      "description": "处理这个群时，顺带知道其它群最近在聊什么（极短，默认 12 分钟窗口）。"
+    },
+    "semanticTopN": {
+      "type": "number",
+      "label": "语义卡最多注入几条",
+      "description": "默认 2。注入越长越贵，一般不用改。"
+    },
+    "costGuard": {
+      "type": "boolean",
+      "label": "成本护栏",
+      "description": "本地统计 prompt 用量，超阈值时自动砍掉可选注入（不调模型、不额外花钱）。"
+    },
+    "dayPromptMax": {
+      "type": "number",
+      "label": "日 prompt 上限（token）",
+      "description": "超过后开始砍可选注入，0 = 不限。默认 800000。"
+    },
+    "chatPromptMax": {
+      "type": "number",
+      "label": "单会话 prompt 上限（token）",
+      "description": "同上，按单个会话统计。默认 200000。"
+    }
+  },
+  "prompt": null
+}

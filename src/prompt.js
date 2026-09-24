@@ -11,6 +11,7 @@
 // 沉睡/唤醒/等待机制（由编排器的"已读/未读驱动"取代）。
 
 import { getConfig } from './config.js';
+import { skillManager } from './skills/manager.js';
 // 滑条换算放在独立模块（零依赖），避免 config.js ↔ prompt.js 循环依赖。
 // 这里 re-export 是为了让已经从 prompt.js 引用的代码不受影响。
 import { sliderToTier as _sliderToTier, tierToSlider as _tierToSlider, TIER_SLIDER_BANDS as _TIER_SLIDER_BANDS } from './tier-slider.js';
@@ -204,7 +205,29 @@ function qqSceneRules() {
 }
 
 /** 组装系统提示。 */
-export function buildSystemPrompt({ persona } = {}) {
+/**
+ * 收集已生效 Skill 的提示词片段（已按 priority 降序）。
+ * priority 上限 99（在 manifest.js 强制），核心安全规则永远排在 Skill 片段之前。
+ */
+function collectSkillSections(context = {}) {
+  // 无 plugin.json 的 prompt 已由 plugin-loader 适配成 manifest.prompt.sections，
+  // 统一从这里取即可。
+  return skillManager.getPromptSections(context);
+}
+
+/** 把 Skill 片段渲染成提示词块。 */
+function renderSkillSections(sections) {
+  if (!sections.length) return [];
+  const out = ['', '【可用技能】', '你已学会以下技能，在合适的场景下主动使用：'];
+  for (const s of sections) {
+    if (s.title) out.push(`■ ${s.title}`);
+    out.push(s.content);
+  }
+  return out;
+}
+
+/** 组装系统提示。 */
+export function buildSystemPrompt({ persona, skillContext, extraSections = [] } = {}) {
   const cfg = persona ?? getConfig().persona;
   const parts = [
     `你是「${cfg.botName}」，一个混在 QQ 群里的普通群友（不是助手、不是客服）。你的所有行为都通过工具完成，发言必须像真人。`,
@@ -239,6 +262,15 @@ export function buildSystemPrompt({ persona } = {}) {
   // 免得在提示词里留一串空行。
   const songText = songRules();
   if (songText) parts.push('', songText);
+
+  // 注入 Skill 提示词片段 + 调用方运行时算出的片段（agent-hooks 的情绪/情爱/棋局/姐妹/临时设定）。
+  // 二者走同一条渲染路径，都排在核心规则之后；且不参与 skillManager 的开关判断（调用方已经判断过）。
+  // ⚠️ 前缀缓存：这些片段可能含"随会话变化"的动态内容，必须**追加在系统提示末尾** ——
+  //    插在中间会把后面核心规则的字节位置推来推去，系统提示的缓存前缀（token 大头）直接归零。
+  const skillSections = [...collectSkillSections(skillContext || {}), ...(Array.isArray(extraSections) ? extraSections : [])]
+    .map((x) => ({ priority: 50, ...x }))
+    .sort((a, b) => (b.priority || 0) - (a.priority || 0));
+  parts.push(...renderSkillSections(skillSections));
 
   if (cfg.customRules && String(cfg.customRules).trim()) {
     parts.push('', '【管理员附加规则】', String(cfg.customRules).trim());
@@ -414,8 +446,16 @@ export function buildPastState(store, chatKey, { excludeIds = [], limit = null }
   const exclude = new Set(excludeIds);
   if (maxLimit <= 0) return { text: '', count: 0, messages: [] };
   let messages = store.recent(chatKey, { limit: maxLimit + exclude.size }).filter((m) => !exclude.has(m.id));
+  // 已经撤回的消息不该再发给模型（撤回后就不该被"看到"）
+  messages = messages.filter((m) => !m.recalled);
+  // 拍一拍事件不进【过去状态】：它是即时召唤信号（已在触发批里出现过了），
+  // 历史里堆一排"[拍一拍] X 拍了拍 Y"只会教模型把拍一拍当聊天内容复读。
+  messages = messages.filter((m) => !m.isPoke);
   // 屏蔽名单兜底过滤：屏蔽生效前已存档的历史消息，也不能再进提示词。
   // 入口拦截只管"新消息"，这里管"老库存"。机器人自己的发言（self）不过滤。
+  // 全局屏蔽（所有群+私聊）+ 按群屏蔽 都要过滤。
+  const globalBlocked = new Set((getConfig().globalBlocklist || []).map(String));
+  if (globalBlocked.size) messages = messages.filter((m) => m.self || !globalBlocked.has(String(m.senderId)));
   const [pKind, pId] = String(chatKey || '').split(':');
   if (pKind === 'group' && pId) {
     const blocked = new Set((getConfig().blocklist?.[pId] || []).map(String));
@@ -437,12 +477,18 @@ function triggerLabels(entry, ctx) {
   const notes = getConfig().memberNotes || {};
   const noteName = notes[String(entry?.senderId || '')];
   const noteLower = String(noteName || '').toLowerCase();
-  if (text.startsWith('@') || text.includes(`@${ctx.selfNickname}`) || (nick && text.includes(`@${nick}`))) labels.push('@我');
+  // 「@我」标签：只做精确的昵称/名片匹配。
+  // ⚠️ 不允许 text.startsWith('@') 这种裸前缀命中 —— "@张三 你看他"这类
+  //   与机器人无关的艾特曾被全部标成「@我」，模型会显著提高回应概率。
+  //   真正的唤醒判定（isAtMe）有完整 CQ 码/昵称匹配，标签与它同口径。
+  const selfNick = String(ctx.selfNickname || '');
+  if ((selfNick && text.includes(`@${selfNick}`)) || (nick && text.includes(`@${nick}`))) labels.push('@我');
   if ((botName && lower.includes(botName)) || (nick && lower.includes(nick))) labels.push('提到我');
   if (noteName && lower.includes(noteLower)) labels.push('提到我（备注名）');
   if (/[?？]$/.test(text.trim()) || /[吗呢]/.test(text)) labels.push('提问');
   if (text.startsWith('[引用 ')) labels.push('引用');
-  if (text.includes('[拍一拍]')) labels.push('拍一拍');
+  // 拍一拍：被拍的是我时标「拍我」（召唤信号），拍别人只标「拍一拍」（背景事件）
+  if (text.includes('[拍一拍]')) labels.push(/拍了拍\s*我/.test(text) ? '拍我' : '拍一拍');
   return labels;
 }
 

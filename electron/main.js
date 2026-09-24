@@ -1,12 +1,37 @@
 // Electron 桌面壳：启动核心服务器（同一进程），打开会话式控制台窗口。
 // 傻瓜式：托盘常驻、关窗不退出、可选开机自启。
-import { app, BrowserWindow, Tray, Menu, nativeImage, session, shell } from 'electron';
+import { app, BrowserWindow, Tray, Menu, nativeImage, session, shell, dialog } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { dataDirName, describeInstance } from '../src/profile.js';
+
 
 // Windows 上部分显卡驱动会导致渲染进程黑屏；禁用硬件加速是最稳妥的修复
 app.disableHardwareAcceleration();
+
+// 主进程兜底：未捕获异常不应静默吞掉。
+// headless 入口（src/server.js）exit(1) 的理由在那里不成立 —— 那个有外层
+// 守护重启。Electron 没有外层守护，进程挂掉后用户只能看到"托盘图标消失"。
+// 折衷：拉起一个可见的错误对话框把异常亮给用户（至少知道为什么挂了），
+// 确认后再退出 —— "半死不活地挂着"（定时器丢失/连接悬空但窗口还在）
+// 是最难排查的状态，宁可死得明明白白。
+process.on('unhandledRejection', (error) => {
+  console.error('[未处理异常]', error);
+});
+process.on('uncaughtException', (error) => {
+  console.error('[未捕获异常]', error);
+  try {
+    // dialog 在 app ready 前也允许调用（Electron 文档保证）。
+    dialog.showErrorBox(
+      'QQ Agent 发生未捕获错误',
+      '程序遇到无法恢复的错误，即将退出。\n\n' +
+      String(error?.stack ?? error?.message ?? error) +
+      '\n\n完整日志见 data/logs/ 下的当日日志文件。'
+    );
+  } catch { /* 弹窗失败不拦截退出 */ }
+  app.exit(1);
+});
 
 // AppUserModelID：让 Windows 把窗口归到「QQ Agent」身份下（任务栏分组/图标/通知），
 // 否则 dev 模式下会被当成裸 electron.exe，钉任务栏变成 electron 图标
@@ -22,10 +47,12 @@ app.setAppUserModelId('cn.kondius.qq-agent');
 function resolveDataDir() {
   if (process.env.QQ_AGENT_DATA_DIR) return process.env.QQ_AGENT_DATA_DIR;
   // 开发模式（.bat 直起 node_modules 里的 electron.exe + 项目目录）：项目内 data/
-  if (!app.isPackaged) return path.resolve(fileURLToPath(import.meta.url), '..', '..', 'data');
-  const portable = path.join(path.dirname(app.getPath('exe')), 'data');
+  if (!app.isPackaged) return path.resolve(fileURLToPath(import.meta.url), '..', '..', dataDirName());
+  const portable = path.join(path.dirname(app.getPath('exe')), dataDirName());
   try {
     if (!fs.existsSync(portable)) {
+      // 仅主实例接管旧版遗留；第二实例绝不能把主实例旧数据复制进 data-2。
+      if (dataDirName() !== 'data') return portable;
       // 接管旧版遗留：%APPDATA%/qq-agent/data（外置期版本）→ 搬回安装目录
       const legacy = path.join(app.getPath('userData'), 'data');
       if (fs.existsSync(legacy) && fs.readdirSync(legacy).length > 0) {
@@ -75,7 +102,7 @@ function showWindow() {
 function createTray() {
   const icon = nativeImage.createFromPath(ICON_PATH);
   tray = new Tray(icon);
-  tray.setToolTip('QQ Agent');
+  tray.setToolTip(describeInstance());
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: '显示主界面', click: () => showWindow() },
     { label: '暂停 / 恢复', click: () => core?.orchestrator.setPaused(!core.orchestrator.paused) },
@@ -101,7 +128,7 @@ function createWindow(port) {
     height: 860,
     minWidth: 960,
     minHeight: 640,
-    title: 'QQ Agent',
+    title: describeInstance(),
     backgroundColor: '#0f1115',
     autoHideMenuBar: true,
     icon: ICON_PATH,
@@ -138,6 +165,17 @@ function createWindow(port) {
     if (/^https?:\/\//.test(url)) shell.openExternal(url);
     return { action: 'deny' };
   });
+  // 主窗口只应停留在本机控制台。没有这道拦截时，页面里一个普通 <a href> 或
+  // location.href=... 就能把主窗口导航到外部站点（脱离 127.0.0.1 源、
+  // 控制台也不再指向本机）。外链改走系统浏览器。
+  const isLocalConsole = (u) => /^http:\/\/(127\.0\.0\.1|localhost|\[::1\]):\d+\//.test(String(u || ''));
+  const guardNavigation = (event, url) => {
+    if (isLocalConsole(url)) return;
+    event.preventDefault();
+    if (/^https?:\/\//.test(String(url || ''))) shell.openExternal(url);
+  };
+  mainWindow.webContents.on('will-navigate', guardNavigation);
+  mainWindow.webContents.on('will-redirect', guardNavigation);
   // 关窗默认缩到托盘（真正退出走托盘菜单），符合"常驻机器人"的使用习惯
   mainWindow.on('close', (event) => {
     if (!quitting && core?.getConfig().server?.closeToTray !== false) {
@@ -170,7 +208,18 @@ app.whenReady().then(async () => {
   }
 });
 
-app.on('before-quit', () => {
+// 退出清理：core.stop() 是 async（要 abortAll / 关 SSE / 关 server / 释放单实例锁），
+// 而 before-quit 是同步事件 —— 直接调它会让进程在 await 让出后就被销毁，
+// 清理链跑一半：锁文件可能残留、会话最后一次进度可能丢、SnowLuma 子进程可能变孤儿。
+// 正确做法：拦下这次退出，等 stop() 真正跑完再 app.quit()。
+let shuttingDown = false;
+app.on('before-quit', (event) => {
   quitting = true;
-  try { core?.stop(); } catch { /* ignore */ }
+  if (shuttingDown || !core) return;      // 第二次进入（自己触发的 quit）直接放行
+  event.preventDefault();
+  shuttingDown = true;
+  Promise.resolve()
+    .then(() => core.stop())
+    .catch((error) => console.error('[electron] 退出清理失败:', error?.message ?? error))
+    .finally(() => app.quit());
 });

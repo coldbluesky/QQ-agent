@@ -1,0 +1,39 @@
+{
+  "id": "weather-query",
+  "name": "天气查询",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "category": "utility",
+  "description": "查城市天气预报：温度区间、天气现象、降水概率。数据来自 Open-Meteo，免费、无需任何配置。",
+  "author": "QQ Agent",
+  "enabledByDefault": true,
+  "permissions": ["web_fetch"],
+  "capabilities": [],
+  "requires": [],
+  "settings": {
+    "defaultDays": 3,
+    "timeoutMs": 8000
+  },
+  "configSchema": {
+    "defaultDays": {
+      "type": "number",
+      "label": "默认预报天数",
+      "description": "模型没说要几天时默认报几天（1~7）。"
+    },
+    "timeoutMs": {
+      "type": "number",
+      "label": "请求超时（毫秒）",
+      "description": "等天气服务响应的最长时间（2000~30000），超时就明确告诉用户网络到不了，而不是干等。"
+    }
+  },
+  "prompt": {
+    "sections": [
+      {
+        "id": "weather-usage",
+        "title": "天气查询",
+        "priority": 45,
+        "content": "用户问天气时调用查天气工具，不要凭感觉编造天气数据——编错天气比不回答更糟。回答时把工具给的日期、温度、天气现象念清楚；工具报错（比如查不到城市、网络超时）就如实转告，不要猜。"
+      }
+    ]
+  }
+}

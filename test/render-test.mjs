@@ -110,6 +110,7 @@ try {
     'renderSettingsSection', 'renderApiSection', 'renderVoiceSection', 'renderSearchSection',
     'renderMemorySettingsSection', 'renderPersonaSection', 'renderAllowSection',
     'renderChatSection', 'renderDesktopSection', 'renderOnebotSection',
+    'renderToolsSection', 'renderPortedSettingsSection', 'renderSecuritySection',
     'renderPersonaPicker', 'renderHealthCard'
   ];
 

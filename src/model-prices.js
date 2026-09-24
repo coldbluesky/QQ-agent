@@ -541,6 +541,27 @@ export function resolveModelPrice(modelId, cfg, priceTable = null) {
   const api = (cfg && cfg.api) || {};
   const useOfficial = api.useOfficialPrice === true;
 
+  // ┚┄┄ 优先级 1：用户为**该模型**单独设定的价格（cfg.modelPrices）。
+  //     JSDoc 一直宣称"一旦设定就用它，与官方表开关无关"，但旧实现是
+  //     开关开启时直接 return 官方表 —— 用户自定义价静默失效，成本看板
+  //     给出错误数字（走中转站时特别常见）。现按文档口径修正：
+  //     自定义价命中 > 官方表 > 全局兜底。
+  const custom = (api.modelPrices || {})[id];
+  const hasCustom = !!(custom && (Number(custom.in) || Number(custom.out)));
+  if (hasCustom) {
+    return {
+      in: Number(custom.in) || 0,
+      out: Number(custom.out) || 0,
+      cached: custom.cached == null ? Number(custom.in) || 0 : Number(custom.cached) || 0,
+      peak: custom.peak || null,
+      image: null,
+      source: 'custom',
+      matched: id,
+      // 编辑性只跟官方开关绑定（官方表模式下输入框只读）
+      locked: useOfficial
+    };
+  }
+
   if (useOfficial) {
     const p = id ? (priceTable ? matchPriceTable(id, priceTable) : resolveOfficialPrice(id)) : null;
     if (p) {
@@ -562,20 +583,6 @@ export function resolveModelPrice(modelId, cfg, priceTable = null) {
       source: 'unmatched',
       matched: null,
       locked: true
-    };
-  }
-
-  const custom = (api.modelPrices || {})[id];
-  if (custom && (Number(custom.in) || Number(custom.out))) {
-    return {
-      in: Number(custom.in) || 0,
-      out: Number(custom.out) || 0,
-      cached: custom.cached == null ? Number(custom.in) || 0 : Number(custom.cached) || 0,
-      peak: custom.peak || null,
-      image: null,
-      source: 'custom',
-      matched: id,
-      locked: false
     };
   }
 

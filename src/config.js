@@ -4,12 +4,23 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PERSONAS } from './personas.js';
 import { sliderToTier } from './tier-slider.js';   // 零依赖模块，避免循环依赖
+import { profileSuffix, portOffset } from './profile.js';   // 多实例：实例号决定数据目录/端口
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const ROOT = path.resolve(__dirname, '..');
-// 测试/便携场景可重定向数据目录
-export const DATA_DIR = process.env.QQ_AGENT_DATA_DIR || path.join(ROOT, 'data');
+// 测试/便携场景可重定向数据目录；多实例（QQ_AGENT_PROFILE=2）用 data-2 / data-3 …
+export const DATA_DIR = process.env.QQ_AGENT_DATA_DIR || path.join(ROOT, `data${profileSuffix()}`);
 export const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
+
+// 官方固定价格表地址（社区分发的只读价格表）。
+export const FIXED_PRICE_REMOTE_URL = 'https://kondius.cn/qq-agent/model-prices.json';
+
+/**
+ * 程序根 —— "同一台机器上所有实例都看得见的那一层"。
+ * 与 ROOT 的区别只在多开时体现（打包部署时 ROOT 是 <程序根>/resources/app）。
+ * 本版本未启用多实例，二者等价。
+ */
+export function instanceRoot() { return ROOT; }
 
 export const DEFAULT_CONFIG = {
   // OpenAI 兼容 API（必填才能跑）
@@ -24,6 +35,16 @@ export const DEFAULT_CONFIG = {
     temperature: 0.8,
     maxRounds: 12,                          // 单次运行的最多工具轮数
     timeoutMs: 180000,
+    // 备选模型：主模型重试仍失败时逐个降级重试。
+    // 每项 { provider?, model }；provider 为空则沿用主模型的 baseUrl + Key。
+    fallbackModels: [],
+    visionModel: '',            // 图片输入专用模型（留空 = 用主模型）
+    videoModel: '',             // 视频输入专用模型（留空 = 用主模型）
+    // 视频读取选路：auto = 配了 videoModel 就原生读视频、否则抽帧；
+    // native = 强制原生视频输入；frames = 强制抽帧；off = 关掉 read_video 的画面部分。
+    videoMode: 'auto',
+    // 模型能不能吃 video 部分（与 vision 相互独立）。默认关 —— 猜错"支持视频"的代价是请求 400。
+    video: false,
     // 成本核算（仅本地估算展示，不参与任何请求）
     priceInputPerM: 0,      // 输入单价（元 / 百万 token）—— 兜底默认值
     priceOutputPerM: 0,     // 输出单价
@@ -149,7 +170,27 @@ export const DEFAULT_CONFIG = {
   },
   // 安全例外（默认全部关闭）
   security: {
-    allowPrivateImageHosts: false           // true 时图片下载允许内网地址（仅本地测试/自建图床）
+    allowPrivateImageHosts: false,          // true 时图片下载允许内网地址（仅本地测试/自建图床）
+    // ── 发网图（send_image）──
+    // 机器人主动往群里发网上找的图。默认关闭：它是"让机器人把任意图片发进群"的能力，
+    // 应当由用户显式打开，而不是默认就有。
+    imageSend: {
+      enabled: false,
+      // 是否强制"先看一眼再发"：模型必须先 send_image(url, preview=true) 确认合适才能真发。
+      // 这是防"模型随手发一张不合适的图"的主要闸门。
+      requirePreview: true,
+      maxPerRun: 3,              // 单次运行最多发几张（防刷屏）
+      maxPreviewsPerRun: 5,      // 单次运行最多预览几张（防反复下载烧流量）
+      maxBytesMB: 5,             // 单图体积上限（MB）
+      skipPreviewForLockedHosts: true   // 浏览锁定站点内的图可跳过预览（站内图源可信）
+    },
+    // 浏览锁定：只允许机器人访问白名单内的域名（家长/老师/自用场景的硬边界）。
+    // 逐跳校验（每次重定向都重新查），子域自动放行（配 example.com 则 img.example.com 也过）。
+    browseLock: {
+      enabled: false,
+      hosts: [],                 // 白名单域名，如 ['example.com', 'wikipedia.org']
+      siteSearchUrl: ''          // 可选：站内搜索模板，用 {query} 占位
+    }
   },
   // SnowLuma / OneBot v11
   snowluma: {
@@ -178,6 +219,12 @@ export const DEFAULT_CONFIG = {
   wakeDelayMs: 2000,        // 空闲时收到消息到发起运行的防抖窗口（等连发聚成一批）
   drainDelayMs: 1200,       // 一次运行结束后发现还有未读，到下一次运行的间隔
   maxConcurrentRuns: 2,     // 全局同时进行的 agent 运行数
+  // 扩展（技能/插件）
+  extensions: {
+    // 监听 skills/ 与 plugins/ 目录，改动后自动重载。
+    // ⚠️ 含义：落地的 JS 会被执行 —— 只放你信任的代码进去。
+    hotReload: true
+  },
   // 发送保护
   send: {
     minGapMs: 1000,         // 相邻两条消息最小间隔
@@ -185,7 +232,8 @@ export const DEFAULT_CONFIG = {
     byLengthMs: 20,         // 按字数附加的间隔（毫秒/字）
     maxPerMinute: 80,
     maxPerHour: 500,
-    hardSplitAt: 4000       // QQ 硬限制切分（0 = 不限制）
+    hardSplitAt: 4000,      // QQ 硬限制切分（0 = 不限制）
+    dedupeWindowMs: 8000    // 同一会话内相同文本的去重窗口（0 = 关闭）
   },
   // 主动开话题（可选）
   proactive: {
@@ -276,11 +324,243 @@ export const DEFAULT_CONFIG = {
   },
   // 桌面端/控制台
   server: {
-    port: 3210,
+    // 主实例 3210；实例 N 整体 +100（N*100），避免多开时 HTTP/OneBot 端口互撞
+    port: 3210 + portOffset(),
     token: '',                // 留空 = 只监听 127.0.0.1
     autoStart: false,         // 开机自启（仅 Electron 桌面端生效）
-    closeToTray: true         // 点关闭 = 最小化到托盘
+    closeToTray: true,        // 点关闭 = 最小化到托盘
+    autoStartPeers: false     // 启动主实例时自动带起其它实例（多开）
   },
+  // ── 工具开关（唯一口径由 tool-registry.getToolAvailability() 计算）──
+  // ⚠️ 边界：tools.* = **工具**层开关（全局/分类/单个工具）；
+  //          skills.* = **能力**层开关（每个 Skill 一个命名空间）。
+  // 最终"能不能用"顺序：tools.enabled → skill 生效 → requires 能力 → 分类 → 单工具 → 运行期依赖。
+  tools: {
+    enabled: true,              // 全局开关：false 时所有工具都禁用
+    overrides: {},              // { [toolId]: boolean } 单个工具的启用状态
+    crossChatSend: false,      // 跨会话发送（默认关）：开启后 send_to 才能用
+    categories: {
+      messaging: true,          // 消息发送
+      sticker: true,            // 表情管理
+      query: true,              // 消息查询
+      memory: true,             // 记忆系统
+      web: true,                // 联网搜索
+      knowledge: true,          // 知识库
+      media: true,              // 媒体理解
+      utility: true,            // 实用工具
+      system: true              // 系统反馈
+    }
+  },
+  // Skill 统一开关：唯一的"能力启停"来源。
+  // 形状：{ [skillId]: { enabled: boolean, ...该 Skill 自己的设置 } }
+  // 这里只存用户改过的值；默认值来自各 Skill 的 skill.json → settings。
+  skills: {},
+
+  // ══════════════════════════════════════════════════════════════════════
+  // 以下配置块随"功能移植"一并加入。与原有同名能力不重复，只补移植模块
+  // 所需的默认值。每个键都有默认值 —— deepMerge 靠它兜底。
+  // ══════════════════════════════════════════════════════════════════════
+
+  // ── 图片搜索（pixiv / 图库 / 反向搜图）──
+  imageSearch: {
+    enabled: true,
+    provider: 'pixiv',            // pixiv | safebooru | konachan | yandere | custom:<id>
+    providers: [],                // 自定义图源：{ id, name, type:'custom', baseUrl, apiKey, cookie, timeoutMs }
+    cookie: '',                   // pixiv 登录 Cookie（可选）：填了能搜到更多、能取原图
+    hideAi: true,                 // 屏蔽 AI 生成图（pixiv 按官方 aiType，图库按标签）
+    aiBlockTags: [],
+    allowR18: false,
+    defaultLimit: 3,
+    maxDownloadMb: 8,
+    sendMode: 'auto',             // auto = 先试直链、失败改内嵌；url 只发直链；base64 一律内嵌
+    timeoutMs: 15000,
+    sortBy: 'popular',            // popular = 按收藏数排序；newest = 按发布时间
+    minBookmarks: 0,
+    rankPool: 24,                 // 按人气排时查多少个候选（每个一次请求；太大会被 pixiv 限流）
+    preferOriginal: true,
+    maxImageMb: 12,
+    minPixels: 0,
+    sauceNaoKey: '',              // SauceNAO API Key（反向搜图用；留空则该源跳过）
+    perChat: {}                   // 按会话覆盖：{ "group:123": { hideAi:false } }
+  },
+
+  // ── 梗知识库（网梗/游戏梗/群内黑话）──
+  meme: {
+    enabled: true,
+    injectEnabled: true,          // 是否把挑出来的梗注入提示词
+    injectMax: 8,
+    injectMaxChars: 1200,
+    searchMax: 8,
+    autoNote: true,
+    recordUsage: true,
+    chatScopeEnabled: true,
+    biliEnabled: true,            // B 站找梗总开关（免登录接口）
+    biliProactive: true,
+    biliHotLimit: 12
+  },
+
+  // ── 实例总线（同机多实例的动态账本）──
+  bus: {
+    enabled: false,               // 总开关：关掉后既不写也不读（单实例用不上）
+    readLimit: 12,
+    windowMin: 180,
+    reportEvents: true
+  },
+
+  // ── 人设蒸馏（从聊天记录/文本反推人物设定）──
+  distill: {
+    maxChatLines: 400,
+    maxPerChat: 200,
+    maxTextLines: 600,
+    autoSwitch: false
+  },
+
+  // ── 情绪系统 ──
+  // 她有持续的情绪状态，会随时间半衰、会被夸奖/冷落推动，也会影响说话风格。
+  emotion: {
+    enabled: false,
+    allowModelUpdate: true,       // 允许她自己通过 set_mood 改情绪
+    allowRules: true,             // 允许按对方消息做轻量助推（被夸→开心、被冷落→委屈…）
+    injectStyle: true,            // 情绪影响说话风格（关掉 = 只记录、不改语气）
+    halfLifeMin: 90,              // 强度半衰期（分钟）
+    minIntensity: 1,
+    intensityMax: 5,
+    baseKey: 'calm',              // 基线情绪
+    decayBack: true,
+    neglectHours: 24,
+    ruleCap: 3,
+    historyMax: 20,
+    maxChats: 200
+  },
+
+  // ── 姐妹系统（同机多实例互相接话）──
+  sister: {
+    enabled: false,
+    followPercent: 35,            // 姐妹开口后我接茬的概率（%）。0 = 从不主动接茬
+    followCooldownSec: 90,
+    windowMin: 10,
+    readLimit: 3,
+    injectRelation: true,
+    shareNotes: true,
+    notesReadLimit: 8,
+    rank: 0                       // 本实例的排行（1=大姐 2=二姐…；0 = 不排辈分）
+  },
+
+  // ── 临时设定（只在某一个群、某一段时间内有效的临时交代）──
+  tempSettings: {
+    enabled: false,
+    defaultTtlMin: 720,           // 不填 ttlMin 时的默认有效期（分钟）＝ 12 小时
+    maxPerGroup: 5,
+    maxGroups: 100,
+    keepBrief: true,              // 过期后是否把"概述"当背景注入
+    briefMaxChars: 60,
+    keepDays: 30,
+    maxChars: 1000,
+    reactWindowMin: 30,           // 「开场反应只做一次」的时限（分钟）；0 = 关掉
+    crossInstance: true,
+    allowCommand: true,           // 群里发「临时设定：…」直接生效
+    commandAllowEveryone: false   // 默认仅管理员可发（防任意群友塞设定）
+  },
+
+  // ── R18 内容许可 + 模型尺度适配 ──
+  // ⚠️ enabled 是管理员总开关，默认关；还要同时满足人设的 nsfw 属性且只在私聊生效。
+  nsfwAdapt: {
+    enabled: false,
+    tier: 'auto',                 // auto = 按模型自动挑；strict/balanced/open = 强制档位
+    softRetry: true               // 软拒绝时按 strict 档换写法重试一次（红线场景永不重试）
+  },
+
+  // ── 情爱值（R18 场景内的欲望累积）──
+  intimacy: {
+    enabled: false,
+    requireNsfw: true,
+    max: 100,
+    baseGain: 4,
+    lightFactor: 1,
+    deepFactor: 1.8,
+    paceSample: 6,
+    paceFastSec: 60,
+    paceSlowSec: 900,
+    paceMax: 1.8,
+    paceMin: 0.7,
+    comboMin: 3,
+    comboWindowSec: 300,
+    comboBoost: 1.25,
+    kinkBoost: 1.8,
+    kinkStackCap: 2.4,
+    idleHalfLifeMin: 240,
+    decayBack: true,
+    activeThreshold: 65,
+    initiateBoost: true,
+    initiateBoostMax: 70,
+    releaseKeepDefault: 0.15,
+    releaseKeepLongGap: 0.35,
+    releaseKeepMany: 0,
+    releaseManyCount: 3,
+    releaseManyWindowMin: 360,
+    releaseLongGapHours: 24,
+    aftermathMin: 20,
+    injectStyle: true,
+    allowModelUpdate: true,
+    lightWords: [],
+    deepWords: [],
+    kinkKeywords: [],
+    kinkKeywordsByPersona: {},
+    historyMax: 20,
+    maxChats: 200
+  },
+
+  // ── 棋局（国际象棋 / 棋路记录）──
+  // 局面不靠她"记"，而是程序存一份权威局面（起始 FEN + 着法序列），每次唤醒回放重算。
+  chess: {
+    enabled: false,
+    showLegalMoves: true,         // ★ 强烈建议开着：模型只需照抄其中一条
+    legalMovesMax: 80,
+    kifuMax: 60,
+    defaultBotSide: 'black',      // 'black' = 对方先走、她陪着下；'white' = 她先走
+    maxGames: 200,
+    archiveMax: 50,
+    undoMax: 10,
+    quietMemory: false
+  },
+
+  // ── 群管理员指令（群内说「禁言 / 解除」）──
+  admin: {
+    enabled: true,
+    admins: {},                   // { [群号]: 管理员QQ号 }；键 '*' = 全局管理员
+    muteReply: ''                 // 禁言期间被 @ 时回的固定话术（留空用内置默认）
+  },
+
+  // ── 说话风格学习（学群友怎么说话，再像他们那样说）──
+  styleLearn: {
+    enabled: false,
+    learnSpeech: true,
+    learnImageReaction: true,
+    learnSticker: true,
+    learnEmoji: true,
+    collectEnabled: true,
+    autoDistill: true,            // 后台自动蒸馏（要花 token，可关掉只手动点）
+    distillMinSamples: 80,
+    distillIntervalMs: 21600000,
+    maxSamples: 3000,
+    maxSpeechItems: 18,
+    maxReactionItems: 18,
+    reactionWindowSec: 180,
+    minTextLen: 2,
+    injectMaxItems: 8,
+    injectMaxChars: 900,
+    captionImages: false,
+    captionMaxPerDay: 30,
+    chatExclude: []
+  },
+
+  // ── 昵称历史（自动维护）：{ [QQ号]: [{ name, at }, ...] }，用来认出"这个人改过名" ──
+  memberAliases: {},
+  // ── 群禁言：{ [群号]: { at, reason, until } }。命中的群完全不触发 AI 运行 ──
+  mutedGroups: {},
+  // ── 主动示好的冷却记录（运行期状态，不是用户配置）──
+  nsfwInitiateState: {},
+
   ui: {
     // 主题：'dark' | 'light' | 'system'（system = 跟随系统偏好）。
     // 前端以 localStorage 为准做到即时生效，这里只是跨设备/重装后保留用。

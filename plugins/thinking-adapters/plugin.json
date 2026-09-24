@@ -1,0 +1,51 @@
+{
+  "id": "thinking-adapters",
+  "name": "思考模式适配",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "category": "model",
+  "description": "识别各厂商的思考/推理参数方言，构造请求参数并提取思考内容与 token 统计。",
+  "author": "QQ Agent",
+  "enabledByDefault": true,
+  "capabilities": [
+    "llm.request-params",
+    "llm.response",
+    "llm.usage",
+    "llm.retry-advisor",
+    "model.thinking-detect"
+  ],
+  "requires": [],
+  "settings": {
+    "mode": "auto",
+    "effort": "",
+    "budget": 0
+  },
+  "configSchema": {
+    "mode": {
+      "type": "enum",
+      "label": "思考模式",
+      "values": ["off", "auto", "on"],
+      "description": "off=明确关闭（支持的渠道才发关闭参数）；auto=跟随模型/网关默认；on=按渠道发送开启参数。"
+    },
+    "effort": {
+      "type": "string",
+      "label": "推理强度",
+      "description": "low / medium / high，仅部分渠道生效（OpenAI o 系、OpenRouter）。留空用默认。"
+    },
+    "budget": {
+      "type": "number",
+      "label": "思考预算（token）",
+      "description": "仅支持 budget 的渠道（Claude 兼容、部分网关）生效。0 = 不指定。"
+    }
+  },
+  "prompt": {
+    "sections": [
+      {
+        "id": "thinking-note",
+        "title": "思考输出",
+        "priority": 30,
+        "content": "你的思考内容不会发送给群友，只有调用发送工具才会真正发言。不要把打算、分析写进要发送的消息里。"
+      }
+    ]
+  }
+}

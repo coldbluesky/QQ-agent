@@ -6,6 +6,20 @@ import crypto from 'node:crypto';
 import { DATA_DIR } from './config.js';
 
 const SESSIONS_DIR = path.join(DATA_DIR, 'sessions');
+// 索引缓存：启动加速的关键。没有它时 #loadIndex 要逐个 readFileSync+JSON.parse
+// 全部会话文件（用户实测 2277 个文件 / 178MB 要 25 秒）；有了它启动只读这一个
+// ~0.5MB 的单文件（3ms 级）。缓存与磁盘文件的增量校验在后台异步做（见
+// reconcileInBackground），所以缓存缺失/过期都只是"首次启动慢"，不会错。
+const INDEX_CACHE_FILE = path.join(DATA_DIR, 'session-index-cache.json');
+const INDEX_CACHE_VERSION = 1;
+// 僵尸回收窗口：上次进程异常退出遗留的 running/waiting 会话只会出现在
+// **最近修改**的文件里（运行中的会话每 2 秒节流落盘一次）。启动时只扫
+// 最近 ZOMBIE_SCAN_WINDOW_DAYS 天的文件就足够，老文件几乎不可能是僵尸——
+// 全量扫 2000+ 文件只为找几个僵尸太亏。
+const ZOMBIE_SCAN_WINDOW_DAYS = 3;
+// 变更后写缓存的防抖间隔：写缓存本身也是 ~0.5MB 的同步 IO，不值得每次
+// update 都写。掉电最坏情况 = 缓存落后几秒，下次启动靠后台对账/补读修正。
+const INDEX_CACHE_WRITE_DEBOUNCE_MS = 5000;
 
 export function newSessionId() {
   return `${Date.now().toString(36)}-${crypto.randomBytes(4).toString('hex')}`;
@@ -29,19 +43,205 @@ export class SessionRegistry {
     this.#loadIndex();
   }
 
-  #loadIndex() {
+  /**
+   * 运行时改保留上限（配置里改了 keepSessionFiles 要立即生效）。
+   * 原来是"只在构造时读一次"，导致用户在设置页改了这个值后，
+   * 要重启才生效 —— 磁盘上的会话文件会一直按旧值（默认 0 = 不限）增长。
+   */
+  setKeepFiles(keepFiles) {
+    const next = Math.max(0, Number.isFinite(Number(keepFiles)) ? Math.round(Number(keepFiles)) : 0);
+    this.keepFiles = next;
+    if (next > 0) {
+      this.index = this.index.slice(0, next);
+      this.#pruneFiles();
+    }
+    this.#scheduleIndexCacheWrite(0);
+  }
+
+  /** 按 keepFiles 清理磁盘上的旧会话文件（保留最新 N 个）。 */
+  #pruneFiles() {
+    if (!(this.keepFiles > 0)) return;
     try {
       const files = fs.readdirSync(SESSIONS_DIR).filter((f) => f.endsWith('.json')).sort().reverse();
-      // keepFiles=0 表示不限制，全部加载
-      const pick = this.keepFiles > 0 ? files.slice(0, this.keepFiles) : files;
-      for (const f of pick) {
-        try {
-          const data = JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, f), 'utf8'));
-          if (data?.id) this.index.push(this.#summary(data));
-        } catch { /* 跳过坏文件 */ }
+      // 运行中/等待中的会话文件不在删除范围：UI 还指着它，删了会出现"详情 404"
+      const activeIds = new Set(
+        [...(this.current?.values?.() ?? [])].map((s) => String(s?.id ?? '')).filter(Boolean)
+      );
+      for (const f of files.slice(this.keepFiles)) {
+        if (activeIds.has(f.replace(/\.json$/, ''))) continue;
+        try { fs.rmSync(path.join(SESSIONS_DIR, f), { force: true }); } catch { /* ignore */ }
       }
-    } catch { /* 目录还没建 */ }
+    } catch { /* ignore */ }
   }
+
+  #loadIndex() {
+    // ── 快路径：读索引缓存（单文件，毫秒级）──
+    // 缓存条目 = 磁盘上全部会话的 summary；启动直接用它当 this.index，
+    // 后台再异步对账（#rebuildIndexInBackground）修正差异（外部删文件/
+    // 缓存写坏/版本变更）。任何缓存问题都会在几秒后被真值覆盖。
+    let diskFiles = null;
+    try {
+      diskFiles = fs.readdirSync(SESSIONS_DIR).filter((f) => f.endsWith('.json')).sort().reverse();
+    } catch { /* 目录还没建 */ }
+    if (diskFiles) {
+      const cached = this.#readIndexCache();
+      if (cached && Array.isArray(cached.entries)) {
+        const cachedIds = new Set(cached.entries.map((e) => e?.id).filter(Boolean));
+        // 只保留磁盘上确实存在的条目（外部删了文件/清理脚本跑过）
+        this.index = cached.entries.filter((e) => diskFiles.includes(`${e.id}.json`));
+        // 磁盘上有、缓存里没有的文件（缓存之后新产生的）→ 同步补读
+        // 通常很少（上次运行结束到缓存写入之间的窗口），大量缺失走后台
+        const missing = diskFiles.filter((f) => !cachedIds.has(f.replace(/\.json$/, '')));
+        if (missing.length > 0 && missing.length <= 200) {
+          for (const f of missing) this.#loadOne(f, /* zombieScan */ false);
+          this.#sortIndex();
+        } else if (missing.length > 200) {
+          // 大量缺失（换数据目录/缓存超老）：直接走慢路径全量读
+          this.index = [];
+          this.#loadAll(diskFiles);
+        } else {
+          this.#sortIndex();
+        }
+        // 僵尸回收单独小窗口扫（见 ZOMBIE_SCAN_WINDOW_DAYS 注释）
+        this.#reclaimZombies(diskFiles);
+        this.#writeIndexCache();
+        return;
+      }
+    }
+    // ── 慢路径：无缓存（首次/缓存损坏）── 全量读 + 写缓存
+    if (diskFiles) this.#loadAll(diskFiles);
+    this.#writeIndexCache();
+  }
+
+  /** 全量读磁盘文件建索引（慢路径，与旧版 #loadIndex 行为一致）。 */
+  #loadAll(diskFiles) {
+    for (const f of diskFiles) this.#loadOne(f, /* zombieScan */ false);
+    this.#reclaimZombies(diskFiles);
+    this.#sortIndex();
+  }
+
+  /** 读单个会话文件进索引。zombieScan=true 时顺带做僵尸回收写回。 */
+  #loadOne(file, zombieScan) {
+    try {
+      const data = JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, file), 'utf8'));
+      if (!data?.id) return;
+      if (zombieScan && (data.status === 'running' || data.status === 'waiting')) {
+        // 僵尸会话回收：进程上次退出时正在运行/等待的会话，运行循环已不存在，
+        // 状态却停留在 running/waiting —— UI 里既不结束也无法中止（中止按钮
+        // 找不到活对象）。这里启动即改判 aborted 并写回文件，让会话页能看到
+        // 真实状态。不改内存 current（启动时它是空的，这些会话本来就不在其中）。
+        data.status = 'aborted';
+        data.endedAt = data.endedAt ?? Date.now();
+        data.abortedOnBoot = true;   // 标记来源，UI/排障能分清"用户中止"和"重启遗留"
+        try { fs.writeFileSync(path.join(SESSIONS_DIR, file), JSON.stringify(data)); } catch { /* 写不回就只改内存视图 */ }
+      }
+      this.index.push(this.#summary(data));
+    } catch { /* 跳过坏文件 */ }
+  }
+
+  /** 僵尸回收：只扫最近 ZOMBIE_SCAN_WINDOW_DAYS 天改过的文件。 */
+  #reclaimZombies(diskFiles) {
+    const cutoff = Date.now() - ZOMBIE_SCAN_WINDOW_DAYS * 86400000;
+    for (const f of diskFiles) {
+      try {
+        const st = fs.statSync(path.join(SESSIONS_DIR, f));
+        if (st.mtimeMs >= cutoff) {
+          const data = JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, f), 'utf8'));
+          if (data?.id && (data.status === 'running' || data.status === 'waiting')) {
+            data.status = 'aborted';
+            data.endedAt = data.endedAt ?? Date.now();
+            data.abortedOnBoot = true;
+            try { fs.writeFileSync(path.join(SESSIONS_DIR, f), JSON.stringify(data)); } catch { /* ignore */ }
+            // 索引里对应条目同步改状态（可能已因 #loadOne 进表）
+            const idx = this.index.findIndex((e) => e.id === data.id);
+            if (idx >= 0) this.index[idx] = this.#summary(data);
+            else this.index.push(this.#summary(data));
+          }
+        }
+      } catch { /* 跳过 */ }
+    }
+  }
+
+  #sortIndex() {
+    this.index.sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0));
+  }
+
+  /** 读索引缓存；版本不匹配/损坏返回 null。 */
+  #readIndexCache() {
+    try {
+      const data = JSON.parse(fs.readFileSync(INDEX_CACHE_FILE, 'utf8'));
+      if (data?.version === INDEX_CACHE_VERSION && Array.isArray(data.entries)) return data;
+    } catch { /* 无缓存/坏缓存 */ }
+    return null;
+  }
+
+  /** 写索引缓存（写前剔除运行中的：它们还没落成最终态，写进去是过期视图）。 */
+  #writeIndexCache() {
+    try {
+      const currentIds = new Set(this.current.keys());
+      const entries = this.index.filter((e) => !currentIds.has(e.id));
+      const tmp = `${INDEX_CACHE_FILE}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify({ version: INDEX_CACHE_VERSION, savedAt: Date.now(), entries }), 'utf8');
+      fs.renameSync(tmp, INDEX_CACHE_FILE);
+    } catch { /* 写缓存失败不影响功能 */ }
+  }
+
+  /**
+   * 防抖写缓存：索引有变动时调这个，而不是直接 #writeIndexCache ——
+   * 运行中的会话每次 update 都会改索引条目，逐次写 0.5MB 同步 IO 太亏。
+   * flushIndexCache()（进程退出前）会立刻落盘。
+   */
+  #scheduleIndexCacheWrite(delay = INDEX_CACHE_WRITE_DEBOUNCE_MS) {
+    if (this.#indexCacheTimer) clearTimeout(this.#indexCacheTimer);
+    this.#indexCacheTimer = setTimeout(() => {
+      this.#indexCacheTimer = null;
+      this.#writeIndexCache();
+    }, delay);
+    this.#indexCacheTimer.unref?.();
+  }
+  #indexCacheTimer = null;
+
+  /** 立即落盘缓存（stop() 调用；清掉防抖定时器当场写）。 */
+  flushIndexCache() {
+    if (this.#indexCacheTimer) { clearTimeout(this.#indexCacheTimer); this.#indexCacheTimer = null; }
+    this.#writeIndexCache();
+  }
+
+  /**
+   * 后台对账：异步全量重扫磁盘，修正缓存路径可能漏掉的差异
+   * （运行中被外部删文件、缓存写入竞态等）。启动毫秒级返回，对账在
+   * 事件循环空闲时进行，不阻塞请求。
+   * @returns {Promise<void>} 完成时 resolve（供测试等待）
+   */
+  reconcileInBackground() {
+    if (this.#reconcileStarted) return Promise.resolve();
+    this.#reconcileStarted = true;
+    return new Promise((resolve) => {
+      setImmediate(() => {
+        try {
+          const diskFiles = fs.readdirSync(SESSIONS_DIR).filter((f) => f.endsWith('.json'));
+          const known = new Set(this.index.map((e) => `${e.id}.json`));
+          let changed = false;
+          for (const f of diskFiles) {
+            if (known.has(f)) continue;
+            // 缓存里没有的新文件（上一进程运行后期产生的）
+            this.#loadOne(f, /* zombieScan */ true);
+            changed = true;
+          }
+          // 缓存里有、磁盘上没有的（外部删除）→ 摘掉
+          const diskSet = new Set(diskFiles);
+          const filtered = this.index.filter((e) => diskSet.has(`${e.id}.json`));
+          if (filtered.length !== this.index.length) { this.index = filtered; changed = true; }
+          if (changed) {
+            this.#sortIndex();
+            this.#writeIndexCache();
+          }
+        } catch { /* 对账失败保持现状 */ }
+        resolve();
+      });
+    });
+  }
+  #reconcileStarted = false;
 
   #summary(s) {
     return {
@@ -89,6 +289,7 @@ export class SessionRegistry {
     this.#persist(session);
     this.index.unshift(this.#summary(session));
     if (this.keepFiles > 0) this.index = this.index.slice(0, this.keepFiles);
+    this.#scheduleIndexCacheWrite();
     return session;
   }
 
@@ -149,6 +350,7 @@ export class SessionRegistry {
     this.#persist(s);
     const idx = this.index.findIndex((e) => e.id === id);
     if (idx >= 0) this.index[idx] = this.#summary(s);
+    this.#scheduleIndexCacheWrite();
     // 清理超出保留数的旧文件
     try {
       if (this.keepFiles > 0) {
@@ -186,7 +388,54 @@ export class SessionRegistry {
       const f = path.join(SESSIONS_DIR, `${id}.json`);
       if (fs.existsSync(f)) fs.unlinkSync(f);
     } catch { /* ignore */ }
+    this.#scheduleIndexCacheWrite();
     return this.index.length < before;
+  }
+
+  /**
+   * 主动删除一条会话记录（含已结束的）。
+   * 与 discard 的区别：discard 只允许删"等待中"的（保护用量记录）；
+   * remove 是用户主动清理历史，允许删任何状态，但**不删正在运行的**（那会丢账）。
+   * @returns {boolean} 是否真的删了
+   */
+  remove(id) {
+    if (!id) return false;
+    const s = this.current.get(id);
+    // 正在运行的会话不能删（usage 还在累加，删了账就乱了）；等待中的可以
+    if (s && s.status === 'running') return false;
+    this.current.delete(id);
+    const before = this.index.length;
+    this.index = this.index.filter((e) => e.id !== id);
+    try {
+      const f = path.join(SESSIONS_DIR, `${id}.json`);
+      if (fs.existsSync(f)) fs.unlinkSync(f);
+    } catch { /* ignore */ }
+    this.#scheduleIndexCacheWrite();
+    return this.index.length < before;
+  }
+
+  /**
+   * 清空全部已结束的会话记录（保留正在运行/等待的）。
+   * @returns {number} 删掉了多少条
+   */
+  clearFinished() {
+    const keepIds = new Set();
+    for (const [id, s] of this.current) {
+      if (s && (s.status === 'running' || s.status === 'waiting')) keepIds.add(id);
+    }
+    let removed = 0;
+    const remaining = [];
+    for (const e of this.index) {
+      if (keepIds.has(e.id)) { remaining.push(e); continue; }
+      removed++;
+      try {
+        const f = path.join(SESSIONS_DIR, `${e.id}.json`);
+        if (fs.existsSync(f)) fs.unlinkSync(f);
+      } catch { /* ignore */ }
+    }
+    this.index = remaining;
+    this.#scheduleIndexCacheWrite();
+    return removed;
   }
 
   listSummaries(limit = 100) {
@@ -226,6 +475,9 @@ export class SessionRegistry {
 
   /** 在会话结束时累加今日用量。 */
   #bumpTodayUsage(s) {
+    /* 零消耗会话（aborted 的等待会话：从未调用模型、token 全 0）不计 runs，
+       否则"今日运行次数"会被暂停/未命中等中止事件虚增，与 LLM 调用次数脱节。 */
+    if ((Number(s.usage?.calls) || 0) === 0 && (Number(s.usage?.totalTokens) || 0) === 0) return;
     const dayKey = localDayKey(s.startedAt);
     let data = { dayKey, promptTokens: 0, completionTokens: 0, totalTokens: 0, cachedTokens: 0, runs: 0, webSearchCount: 0 };
     try {

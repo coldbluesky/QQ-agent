@@ -1,0 +1,44 @@
+{
+  "id": "sticker-annotate",
+  "name": "表情批量标注",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "category": "media",
+  "description": "一次性把还没备注的表情看一遍并写好含义/标签，省得以后每次用都要临时认图。",
+  "author": "QQ Agent",
+  "enabledByDefault": false,
+  "capabilities": [],
+  "requires": [],
+  "settings": {
+    "batchSize": 6,
+    "overwriteExisting": false,
+    "maxTags": 5
+  },
+  "configSchema": {
+    "batchSize": {
+      "type": "number",
+      "label": "每批看几张",
+      "description": "一次交给视觉模型辨认的表情数量（1~12，默认 6）。调大更快但单次请求更贵，也更容易超出图片输入上限。"
+    },
+    "overwriteExisting": {
+      "type": "boolean",
+      "label": "覆盖已有备注",
+      "description": "默认只补没备注的。打开后会连你手写过的备注一起改掉——除非你确定要重来一遍，否则别开。"
+    },
+    "maxTags": {
+      "type": "number",
+      "label": "每个表情最多几个标签",
+      "description": "标签太多反而不好筛选，默认 5 个，上限 20。"
+    }
+  },
+  "prompt": {
+    "sections": [
+      {
+        "id": "sticker-annotate-usage",
+        "title": "表情批量标注",
+        "priority": 30,
+        "content": "当群里刚收藏了一批表情、或你发现表情库里有大量「无备注可先看图」的条目时，可以主动调用表情批量标注工具，一次看一批并写好含义——比每次临时认图省事。这是**批量整理**用的，单张表情想记点什么请用 sticker_note。"
+      }
+    ]
+  }
+}

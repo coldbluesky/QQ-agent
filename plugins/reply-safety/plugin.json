@@ -1,0 +1,57 @@
+{
+  "id": "reply-safety",
+  "name": "回复安全网",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "category": "message",
+  "description": "为未按工具协议发言的模型提供内联调用解析、保守回复抢救和本地收尾策略。",
+  "enabledByDefault": false,
+  "capabilities": [
+    "reply.inline-calls",
+    "reply.salvage",
+    "reply.grounded-select",
+    "reply.local-policy",
+    "reply.loose-send",
+    "reply.salvage-lines",
+    "reply.is-planning-text"
+  ],
+  "requires": [],
+  "settings": {
+    "inlineCalls": true,
+    "salvage": false,
+    "groundedSelect": false,
+    "localPolicy": false
+  },
+  "configSchema": {
+    "inlineCalls": {
+      "type": "boolean",
+      "label": "解析正文工具调用",
+      "description": "识别模型误写在正文中的工具调用和松散调用格式。"
+    },
+    "salvage": {
+      "type": "boolean",
+      "label": "抢救正文成稿",
+      "description": "仅在文本明显是可直接发送的成品回复时保守提取。"
+    },
+    "groundedSelect": {
+      "type": "boolean",
+      "label": "草稿溯源筛选",
+      "description": "只允许从已记录草稿中选择未发送的原句。"
+    },
+    "localPolicy": {
+      "type": "boolean",
+      "label": "本地模型收尾策略",
+      "description": "为指定本地小模型计算回复预算和安全收尾条件。"
+    }
+  },
+  "prompt": {
+    "sections": [
+      {
+        "id": "reply-tool-protocol",
+        "title": "回复落地",
+        "priority": 40,
+        "content": "想发言必须通过工具调用落地，纯文本只是思考；不要把回复内容、工具调用或发送计划写在正文中。"
+      }
+    ]
+  }
+}

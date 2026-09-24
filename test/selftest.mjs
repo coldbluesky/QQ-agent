@@ -1474,7 +1474,7 @@ refs:
       return hit && String(hit.text).includes('合并转发') ? hit : null;
     }, 8000, '合并转发消息入档并展开');
     assert.ok(msgs.text.includes('[合并转发 共2条]'), '应有合并转发头');
-    assert.ok(msgs.text.includes('转发者A: 第一段转发内容，谁懂'), '应展开文字节点');
+    assert.ok(msgs.text.includes('转发者A(QQ:1001): 第一段转发内容，谁懂'), '应展开文字节点（发言人带 QQ 号）');
     assert.ok(msgs.text.includes('转发者B'), '应展开带图节点');
     const imgMedia = (msgs.media || []).find((x) => x.file === 'fwd.png');
     assert.ok(imgMedia, '转发里的图片应进 media（取图/金句可用）');

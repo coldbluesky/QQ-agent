@@ -364,6 +364,9 @@ function switchTab(name) {
   if (name === 'memory') loadMemoryView();
   if (name === 'usage') loadUsageView({ force: true });
   if (name === 'snowluma') loadSnowlumaPage();
+  if (name === 'skills') loadSkillsView();
+  if (name === 'instances') loadInstancesView();
+  if (name === 'ported') loadPortedView();
   if (name === 'settings') loadSettings();
 }
 
@@ -2780,6 +2783,9 @@ function renderSettingsSidebar() {
     ['persona', '人设'],
     ['allow', '聊天白名单'],
     ['chat', '聊天设置'],
+    ['tools', '工具与技能'],
+    ['ported', '扩展功能'],
+    ['security', '安全与限制'],
     ['desktop', '桌面端'],
     ['onebot', 'OneBot（SnowLuma）']
   ];
@@ -2817,6 +2823,8 @@ function renderSettings() {
   box.innerHTML = `
     ${renderSettingsSection(c)}`;
   bindSettingsEvents(c);
+  // 工具可用性是异步拉的（一次拿全），渲染完再填充
+  if ((state.settingsSection || 'api') === 'tools') loadToolsAvailability();
 }
 
 function renderSettingsSection(c) {
@@ -2829,6 +2837,9 @@ function renderSettingsSection(c) {
     persona: () => renderPersonaSection(c),
     allow: () => renderAllowSection(c),
     chat: () => renderChatSection(c),
+    tools: () => renderToolsSection(c),
+    ported: () => renderPortedSettingsSection(c),
+    security: () => renderSecuritySection(c),
     desktop: () => renderDesktopSection(c),
     onebot: () => renderOnebotSection(c)
   };
@@ -2839,6 +2850,163 @@ function renderSettingsSection(c) {
       <span id="cfg-save-result" class="muted"></span>
     </div>
     ${render()}`;
+}
+
+// ── 工具与技能 ───────────────────────────────────────────────────────────
+const TOOL_CATEGORY_LABELS = {
+  messaging: '消息发送', sticker: '表情管理', query: '消息查询', memory: '记忆系统',
+  web: '联网搜索', knowledge: '知识库', media: '媒体理解', utility: '实用工具', system: '系统反馈'
+};
+
+function renderToolsSection(c) {
+  const tools = c.tools || {};
+  const cats = tools.categories || {};
+  const catRows = Object.entries(TOOL_CATEGORY_LABELS).map(([id, label]) => `
+    <div class="checkbox-row"><input type="checkbox" class="cfg-tool-cat" data-cat="${id}" ${cats[id] !== false ? 'checked' : ''} />
+      <label>${label}</label></div>`).join('');
+  return `
+    <h3 id="settings-tools">工具与技能</h3>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-tools-enabled" ${tools.enabled !== false ? 'checked' : ''} />
+      <label for="cfg-tools-enabled">工具总开关（关闭后模型看不到任何工具）</label></div>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-tools-crosschat" ${tools.crossChatSend === true ? 'checked' : ''} />
+      <label for="cfg-tools-crosschat">允许跨会话发送（send_to：让机器人把消息发到白名单内的其它群/私聊）</label></div>
+    <div class="hint">这是社交敏感操作（可能被诱导去骚扰别的会话），默认关闭。</div>
+
+    <div class="settings-divider"></div>
+    <h3>工具分类</h3>
+    ${catRows}
+
+    <div class="settings-divider"></div>
+    <h3>单个工具</h3>
+    <div class="hint">勾选 = 启用；括号里是"当前环境不可用的原因"。技能提供的工具在「技能」页按技能整体开关。</div>
+    <div id="tools-availability" class="muted" style="margin-top:8px">加载中…</div>`;
+}
+
+async function loadToolsAvailability() {
+  const box = $('#tools-availability');
+  if (!box) return;
+  try {
+    const data = await api('/api/tools/availability');
+    const cats = data.categories || {};
+    const rows = (data.tools || []).map((t) => {
+      const cat = cats[t.category]?.name || t.category;
+      return `<div class="checkbox-row" style="margin:3px 0">
+        <input type="checkbox" class="cfg-tool" data-tool="${esc(t.id)}" ${t.enabled ? 'checked' : ''} />
+        <label style="min-width:200px">${esc(t.id)}</label>
+        <span class="muted" style="font-size:12px">${esc(cat)}${t.skillId ? ` · ${esc(t.skillId)}` : ''}</span>
+        ${t.enabled ? '' : `<span style="font-size:12px;color:var(--orange)">（${esc(t.reason || '不可用')}）</span>`}
+      </div>`;
+    }).join('');
+    box.innerHTML = rows || '（没有工具）';
+  } catch (error) {
+    box.textContent = `加载失败：${error?.message ?? error}`;
+  }
+}
+
+// ── 扩展功能（移植层）────────────────────────────────────────────────────
+function renderPortedSettingsSection(c) {
+  const em = c.emotion || {};
+  const im = c.intimacy || {};
+  const ch = c.chess || {};
+  const si = c.sister || {};
+  const ts = c.tempSettings || {};
+  const sl = c.styleLearn || {};
+  const bu = c.bus || {};
+  const me = c.meme || {};
+  const is = c.imageSearch || {};
+  const ns = c.nsfwAdapt || {};
+  const sw = (id, label, checked, hint = '') => `
+    <div class="checkbox-row"><input type="checkbox" id="${id}" ${checked ? 'checked' : ''} />
+      <label for="${id}">${label}</label></div>${hint ? `<div class="hint">${hint}</div>` : ''}`;
+  return `
+    <h3 id="settings-ported">扩展功能</h3>
+    <div class="hint">这些模块随「功能移植」加入，默认关闭 —— 开启后才会写入状态文件或注入提示词。改动对当前实例立即生效。</div>
+
+    <div class="settings-divider"></div>
+    <h3>情绪 / 情爱</h3>
+    ${sw('cfg-em-enabled', '情绪系统（有持续情绪，随时间半衰、受夸奖/冷落推动）', em.enabled === true)}
+    ${sw('cfg-em-style', '情绪影响说话风格（关掉 = 只记录、不改语气）', em.injectStyle !== false)}
+    <div class="field-row">
+      <div class="field"><label>情绪半衰期（分钟）</label><input type="number" id="cfg-em-halflife" min="5" max="1440" value="${esc(em.halfLifeMin ?? 90)}" /></div>
+    </div>
+    ${sw('cfg-im-enabled', '情爱值（R18 场景内的欲望累积；只在放行的会话里涨）', im.enabled === true)}
+
+    <div class="settings-divider"></div>
+    <h3>棋局</h3>
+    ${sw('cfg-chess-enabled', '国际象棋（权威局面 + 合法着法注入，杜绝幻觉步）', ch.enabled === true)}
+
+    <div class="settings-divider"></div>
+    <h3>临时设定</h3>
+    ${sw('cfg-ts-enabled', '临时设定（只在某个群、某段时间内有效的临时交代）', ts.enabled === true)}
+    ${sw('cfg-ts-command', '允许群内指令（在群里发「临时设定：… 持续 N 分钟」直接生效）', ts.allowCommand !== false)}
+
+    <div class="settings-divider"></div>
+    <h3>说话风格学习</h3>
+    ${sw('cfg-sl-enabled', '学习群友的说话风格，再像他们那样说', sl.enabled === true)}
+    ${sw('cfg-sl-autodistill', '后台自动蒸馏（会花 token；关掉 = 只采集，手动蒸馏）', sl.autoDistill !== false)}
+
+    <div class="settings-divider"></div>
+    <h3>梗知识库</h3>
+    ${sw('cfg-meme-enabled', '梗知识库（管理员维护的网梗/群内黑话，按相关度注入）', me.enabled !== false)}
+    ${sw('cfg-meme-bili', 'B 站找梗（免登录接口；关掉 = 只能手动维护）', me.biliEnabled !== false)}
+
+    <div class="settings-divider"></div>
+    <h3>图片搜索（search_image / reverse_image_search）</h3>
+    ${sw('cfg-is-enabled', '启用图搜工具', is.enabled !== false)}
+    ${sw('cfg-is-hideai', '屏蔽 AI 生成图', is.hideAi !== false)}
+    ${sw('cfg-is-r18', '允许 R18 结果（开之前先想清楚）', is.allowR18 === true)}
+
+    <div class="settings-divider"></div>
+    <h3>R18 尺度适配</h3>
+    ${sw('cfg-nsfw-enabled', '允许 R18 内容（管理员总开关，默认关；还需人设属性且只在私聊生效）', ns.enabled === true)}
+    <div class="field"><label>表达档位</label>
+      <select id="cfg-nsfw-tier">
+        ${['auto', 'strict', 'balanced', 'open'].map((t) => `<option value="${t}" ${String(ns.tier || 'auto') === t ? 'selected' : ''}>${t}${t === 'auto' ? '（按模型自动挑）' : ''}</option>`).join('')}
+      </select></div>
+
+    <div class="settings-divider"></div>
+    <h3>多实例（姐妹 / 活动账本）</h3>
+    ${sw('cfg-sister-enabled', '姐妹系统（同机多实例互相接话）', si.enabled === true)}
+    ${sw('cfg-bus-enabled', '活动账本（让同机的其它实例知道"我刚说了什么"）', bu.enabled === true)}
+    <div class="field-row">
+      <div class="field"><label>姐妹接茬概率（%）</label><input type="number" id="cfg-sister-follow" min="0" max="100" value="${esc(si.followPercent ?? 35)}" /></div>
+    </div>`;
+}
+
+// ── 安全与限制 ───────────────────────────────────────────────────────────
+function renderSecuritySection(c) {
+  const sec = c.security || {};
+  const img = sec.imageSend || {};
+  const lock = sec.browseLock || {};
+  const hosts = Array.isArray(lock.hosts) ? lock.hosts.join('\n') : '';
+  return `
+    <h3 id="settings-security">安全与限制</h3>
+
+    <h3>发网图（send_image / search_images）</h3>
+    <div class="hint">让机器人主动往群里发网上找的图。默认关闭 —— 应当由你显式打开，而不是默认就有。</div>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-imgsend-enabled" ${img.enabled === true ? 'checked' : ''} />
+      <label for="cfg-imgsend-enabled">启用发网图</label></div>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-imgsend-preview" ${img.requirePreview !== false ? 'checked' : ''} />
+      <label for="cfg-imgsend-preview">强制"先看一眼再发"（模型必须先预览确认，才能真发出去）</label></div>
+    <div class="field-row">
+      <div class="field"><label>单次运行最多发几张</label><input type="number" id="cfg-imgsend-max" min="1" max="20" value="${esc(img.maxPerRun ?? 3)}" /></div>
+      <div class="field"><label>单张体积上限（MB）</label><input type="number" id="cfg-imgsend-maxmb" min="1" max="20" value="${esc(img.maxBytesMB ?? 5)}" /></div>
+    </div>
+
+    <div class="settings-divider"></div>
+    <h3>浏览锁定</h3>
+    <div class="hint">把"机器人能访问哪些域名"收成白名单，抓网页与下载图片都**逐跳**校验（含重定向目标）。</div>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-browselock-enabled" ${lock.enabled === true ? 'checked' : ''} />
+      <label for="cfg-browselock-enabled">启用浏览锁定</label></div>
+    <div class="field"><label>允许的域名（一行一个，支持子域）</label>
+      <textarea id="cfg-browselock-hosts" rows="5" placeholder="example.com&#10;zh.wikipedia.org">${esc(hosts)}</textarea></div>
+    <div class="field"><label>站内搜索模板（可选，用 {query} 占位）</label>
+      <input type="text" id="cfg-browselock-search" value="${esc(lock.siteSearchUrl || '')}" placeholder="https://example.com/search?q={query}" /></div>
+
+    <div class="settings-divider"></div>
+    <h3>例外</h3>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-allowprivateimage" ${sec.allowPrivateImageHosts === true ? 'checked' : ''} />
+      <label for="cfg-allowprivateimage">允许图片下载访问内网地址（仅本地测试/自建图床）</label></div>`;
 }
 
 function renderApiSection(c) {
@@ -2876,6 +3044,27 @@ function renderApiSection(c) {
     <div class="checkbox-row"><input type="checkbox" id="cfg-vision" ${c.api.vision !== false ? 'checked' : ''} />
       <label for="cfg-vision">图片输入（关闭则移除看图工具，模型只会看到 [图片] 占位符）</label>
       <span id="vision-switch-hint" class="muted" style="font-size:12px;align-self:center"></span></div>
+
+    <div class="settings-divider"></div>
+
+    <h3>多模态与容错</h3>
+    <div class="field-row">
+      <div class="field"><label>图片输入专用模型（留空 = 用主模型）</label>
+        <input type="text" id="cfg-vision-model" value="${esc(c.api.visionModel || '')}" placeholder="只在真的要"看图"时才切过去" /></div>
+      <div class="field"><label>视频输入专用模型（留空 = 用主模型）</label>
+        <input type="text" id="cfg-video-model" value="${esc(c.api.videoModel || '')}" placeholder="全模态模型" /></div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>视频读取模式</label>
+        <select id="cfg-video-mode">
+          ${[['auto', '自动：配了视频专用模型就原生读，否则抽帧'], ['native', '强制原生视频输入'], ['frames', '强制抽帧截图'], ['off', '关闭画面（只给元信息）']]
+            .map(([v, t]) => `<option value="${v}" ${String(c.api.videoMode || 'auto') === v ? 'selected' : ''}>${t}</option>`).join('')}
+        </select></div>
+    </div>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-video" ${c.api.video === true ? 'checked' : ''} />
+      <label for="cfg-video">当前模型支持视频输入（勾了才会把视频/GIF 当作 video 部件发给模型）</label></div>
+    <div class="field"><label>备选模型（主模型重试仍失败时逐个降级；每行一个，可写 <code>providerId:模型名</code>）</label>
+      <textarea id="cfg-fallback-models" rows="3" placeholder="deepseek-chat&#10;openrouter:anthropic/claude-sonnet-4">${esc((c.api.fallbackModels || []).map((f) => (f.provider ? `${f.provider}:${f.model}` : f.model)).join('\n'))}</textarea></div>
 
     <div class="settings-divider"></div>
 
@@ -5052,6 +5241,23 @@ async function saveConfig({ quiet = false } = {}) {
       vision: chk('#cfg-vision', c.api.vision !== false),
       temperature: Number(val('#cfg-temperature', c.api.temperature)) || 0.8,
       maxRounds: Number(val('#cfg-maxrounds', c.api.maxRounds)) || 12,
+      // 多模态与容错：专用模型 / 视频模式 / 备选模型降级
+      visionModel: String(val('#cfg-vision-model', c.api.visionModel || '')).trim(),
+      videoModel: String(val('#cfg-video-model', c.api.videoModel || '')).trim(),
+      videoMode: String(val('#cfg-video-mode', c.api.videoMode || 'auto')),
+      video: chk('#cfg-video', c.api.video === true),
+      // 每行一个；`providerId:模型名` 表示该备选走另一个提供商的端点与 Key
+      fallbackModels: String(val('#cfg-fallback-models', ''))
+        .split('\n').map((s) => s.trim()).filter(Boolean).slice(0, 10)
+        .map((line) => {
+          const i = line.indexOf(':');
+          // 排除 `https://...` 这种把冒号当协议分隔符的写法
+          if (i > 0 && !/^https?$/i.test(line.slice(0, i))) {
+            return { provider: line.slice(0, i).trim(), model: line.slice(i + 1).trim() };
+          }
+          return { model: line };
+        })
+        .filter((f) => f.model),
       // 成本核算：官方价开关（走中转站时通常要关掉开关自己填）
       useOfficialPrice: chk('#cfg-useofficialprice', c.api.useOfficialPrice !== false),
       // 远程价格表 URL：留空 = 只用内置表
@@ -5316,6 +5522,84 @@ async function saveConfig({ quiet = false } = {}) {
       httpUrl: val('#cfg-httpurl', c.snowluma?.httpUrl || '').trim(),
       accessToken: val('#cfg-obtoken', c.snowluma?.accessToken || '').trim(),
       httpAccessToken: val('#cfg-obhttptoken', c.snowluma?.httpAccessToken || '').trim()
+    };
+  }
+
+  if (sec === 'tools') {
+    const cats = { ...(c.tools?.categories || {}) };
+    document.querySelectorAll('.cfg-tool-cat').forEach((el) => { cats[el.dataset.cat] = el.checked; });
+    const overrides = { ...(c.tools?.overrides || {}) };
+    document.querySelectorAll('.cfg-tool').forEach((el) => { overrides[el.dataset.tool] = el.checked; });
+    patch.tools = {
+      enabled: chk('#cfg-tools-enabled', c.tools?.enabled !== false),
+      crossChatSend: chk('#cfg-tools-crosschat', c.tools?.crossChatSend === true),
+      categories: cats,
+      overrides
+    };
+  }
+
+  if (sec === 'ported') {
+    patch.emotion = {
+      ...(c.emotion || {}),
+      enabled: chk('#cfg-em-enabled', c.emotion?.enabled === true),
+      injectStyle: chk('#cfg-em-style', c.emotion?.injectStyle !== false),
+      halfLifeMin: Math.max(5, Number(val('#cfg-em-halflife', c.emotion?.halfLifeMin ?? 90)) || 90)
+    };
+    patch.intimacy = { ...(c.intimacy || {}), enabled: chk('#cfg-im-enabled', c.intimacy?.enabled === true) };
+    patch.chess = { ...(c.chess || {}), enabled: chk('#cfg-chess-enabled', c.chess?.enabled === true) };
+    patch.tempSettings = {
+      ...(c.tempSettings || {}),
+      enabled: chk('#cfg-ts-enabled', c.tempSettings?.enabled === true),
+      allowCommand: chk('#cfg-ts-command', c.tempSettings?.allowCommand !== false)
+    };
+    patch.styleLearn = {
+      ...(c.styleLearn || {}),
+      enabled: chk('#cfg-sl-enabled', c.styleLearn?.enabled === true),
+      autoDistill: chk('#cfg-sl-autodistill', c.styleLearn?.autoDistill !== false)
+    };
+    patch.meme = {
+      ...(c.meme || {}),
+      enabled: chk('#cfg-meme-enabled', c.meme?.enabled !== false),
+      biliEnabled: chk('#cfg-meme-bili', c.meme?.biliEnabled !== false)
+    };
+    patch.imageSearch = {
+      ...(c.imageSearch || {}),
+      enabled: chk('#cfg-is-enabled', c.imageSearch?.enabled !== false),
+      hideAi: chk('#cfg-is-hideai', c.imageSearch?.hideAi !== false),
+      allowR18: chk('#cfg-is-r18', c.imageSearch?.allowR18 === true)
+    };
+    patch.nsfwAdapt = {
+      ...(c.nsfwAdapt || {}),
+      enabled: chk('#cfg-nsfw-enabled', c.nsfwAdapt?.enabled === true),
+      tier: String(val('#cfg-nsfw-tier', c.nsfwAdapt?.tier || 'auto'))
+    };
+    patch.sister = {
+      ...(c.sister || {}),
+      enabled: chk('#cfg-sister-enabled', c.sister?.enabled === true),
+      followPercent: Math.min(100, Math.max(0, Number(val('#cfg-sister-follow', c.sister?.followPercent ?? 35)) || 0))
+    };
+    patch.bus = { ...(c.bus || {}), enabled: chk('#cfg-bus-enabled', c.bus?.enabled === true) };
+  }
+
+  if (sec === 'security') {
+    const hosts = String(val('#cfg-browselock-hosts', ''))
+      .split('\n').map((s) => s.trim()).filter(Boolean).slice(0, 200);
+    patch.security = {
+      ...(c.security || {}),
+      allowPrivateImageHosts: chk('#cfg-allowprivateimage', c.security?.allowPrivateImageHosts === true),
+      imageSend: {
+        ...(c.security?.imageSend || {}),
+        enabled: chk('#cfg-imgsend-enabled', c.security?.imageSend?.enabled === true),
+        requirePreview: chk('#cfg-imgsend-preview', c.security?.imageSend?.requirePreview !== false),
+        maxPerRun: Math.max(1, Number(val('#cfg-imgsend-max', c.security?.imageSend?.maxPerRun ?? 3)) || 3),
+        maxBytesMB: Math.max(1, Number(val('#cfg-imgsend-maxmb', c.security?.imageSend?.maxBytesMB ?? 5)) || 5)
+      },
+      browseLock: {
+        ...(c.security?.browseLock || {}),
+        enabled: chk('#cfg-browselock-enabled', c.security?.browseLock?.enabled === true),
+        hosts,
+        siteSearchUrl: String(val('#cfg-browselock-search', c.security?.browseLock?.siteSearchUrl || '')).trim()
+      }
     };
   }
 
@@ -5877,6 +6161,315 @@ $('#quote-confirm-btn')?.addEventListener('click', () => openQuoteConfirmModal()
 $$('.tab').forEach((tab) => {
   tab.addEventListener('click', () => switchTab(tab.dataset.tab));
 });
+
+// ── 技能 / 插件页 ─────────────────────────────────────────────────────────
+const SKILL_KIND_LABEL = { skill: '技能', plugin: '插件' };
+
+function skillsEsc(v) {
+  return String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+async function loadSkillsView(force = false) {
+  const box = $('#skills-page');
+  if (!box) return;
+  if (!force && box.dataset.loaded === '1') return;
+  box.innerHTML = '<div class="empty-hint">加载中…</div>';
+  try {
+    // 列表里已经带了 settings/configSchema，够渲染整页
+    const [data, avail] = await Promise.all([api('/api/skills'), api('/api/tools/availability')]);
+    box.dataset.loaded = '1';
+    renderSkillsView(box, data, avail);
+  } catch (error) {
+    box.innerHTML = `<div class="empty-hint">加载失败：${skillsEsc(error?.message ?? error)}</div>`;
+  }
+}
+
+function skillBadge(s) {
+  if (s.loadError) return '<span class="skill-badge bad">加载失败</span>';
+  if (s.active) return '<span class="skill-badge ok">运行中</span>';
+  if (!s.enabled) return '<span class="skill-badge off">已停用</span>';
+  return `<span class="skill-badge warn">${skillsEsc(s.reason || '不可用')}</span>`;
+}
+
+function skillSettingsForm(s) {
+  const schema = s.configSchema || {};
+  const values = s.settings || {};
+  const keys = [...new Set([...Object.keys(values), ...Object.keys(schema)])];
+  if (!keys.length) return '';
+  const fields = keys.map((k) => {
+    const def = schema[k] || {};
+    const label = skillsEsc(def.label || def.title || k);
+    const desc = def.description ? `<div class="muted skill-field-desc">${skillsEsc(def.description)}</div>` : '';
+    const val = values[k];
+    let input;
+    if (Array.isArray(def.enum) && def.enum.length) {
+      input = `<select data-skill-field="${skillsEsc(k)}">${def.enum
+        .map((o) => `<option value="${skillsEsc(o)}" ${String(val) === String(o) ? 'selected' : ''}>${skillsEsc(o)}</option>`)
+        .join('')}</select>`;
+    } else if (def.type === 'boolean' || typeof val === 'boolean') {
+      input = `<input type="checkbox" data-skill-field="${skillsEsc(k)}" ${val ? 'checked' : ''} />`;
+    } else if (def.type === 'number' || typeof val === 'number') {
+      input = `<input type="number" data-skill-field="${skillsEsc(k)}" value="${skillsEsc(val ?? '')}" />`;
+    } else if (def.secret) {
+      input = `<input type="password" data-skill-field="${skillsEsc(k)}" value="${skillsEsc(val ?? '')}" placeholder="留空 = 不修改" />`;
+    } else {
+      input = `<input type="text" data-skill-field="${skillsEsc(k)}" value="${skillsEsc(val ?? '')}" />`;
+    }
+    return `<label class="skill-field"><span class="skill-field-label">${label}</span>${input}${desc}</label>`;
+  }).join('');
+  return `<div class="skill-settings hidden"><div class="skill-settings-grid">${fields}</div>
+    <div class="skill-settings-actions"><button class="btn btn-small btn-primary" data-skill-save="${skillsEsc(s.id)}">保存</button></div></div>`;
+}
+
+function renderSkillsView(box, data, avail) {
+  const skills = Array.isArray(data?.skills) ? data.skills : [];
+  const summary = data?.summary || {};
+  const tools = Array.isArray(avail?.tools) ? avail.tools : [];
+  const disabledTools = tools.filter((t) => !t.enabled);
+  const rows = skills.map((s) => `
+    <div class="skill-row" data-skill-row="${skillsEsc(s.id)}">
+      <label class="skill-toggle" title="启用 / 停用">
+        <input type="checkbox" data-skill-toggle="${skillsEsc(s.id)}" ${s.enabled ? 'checked' : ''} ${s.loadError ? 'disabled' : ''} />
+      </label>
+      <div class="skill-main">
+        <div class="skill-title">${skillsEsc(s.name || s.id)} ${skillBadge(s)}
+          <span class="muted skill-meta">${skillsEsc(s.id)} · v${skillsEsc(s.version || '?')}${s.kind ? ` · ${skillsEsc(SKILL_KIND_LABEL[s.kind] || s.kind)}` : ''}</span>
+        </div>
+        ${s.description ? `<div class="muted skill-desc">${skillsEsc(s.description)}</div>` : ''}
+        ${s.loadError ? `<div class="skill-err">${skillsEsc(s.loadError)}</div>` : ''}
+        ${!s.loadError && !s.active && s.reason ? `<div class="muted skill-reason">${skillsEsc(s.reason)}</div>` : ''}
+        ${(s.missingRequires || []).length ? `<div class="skill-err">缺少能力：${skillsEsc(s.missingRequires.join(', '))}</div>` : ''}
+      </div>
+      <div class="skill-actions">
+        ${s.hasSettings ? `<button class="btn btn-small" data-skill-settings="${skillsEsc(s.id)}">设置</button>` : ''}
+      </div>
+      ${s.hasSettings ? skillSettingsForm(s) : ''}
+    </div>`).join('');
+
+  box.innerHTML = `
+    <div class="skills-head">
+      <div class="skills-summary muted">
+        共 ${summary.total ?? skills.length} 项：运行中 ${summary.active ?? 0} · 已停用 ${summary.disabled ?? 0}${summary.broken ? ` · 异常 ${summary.broken}` : ''}
+        ｜工具 ${tools.length} 个${disabledTools.length ? `（${disabledTools.length} 个当前不可用）` : ''}
+      </div>
+      <button class="btn btn-small" id="skills-reload">重扫磁盘</button>
+    </div>
+    <div class="skills-list">${rows || '<div class="empty-hint">skills/ 与 plugins/ 目录为空</div>'}</div>
+    <details class="skills-tools">
+      <summary>工具可用性（${tools.length}）</summary>
+      <table class="usage-table"><thead><tr><th>工具</th><th>分类</th><th>状态</th><th>说明</th></tr></thead><tbody>
+        ${tools.map((t) => `<tr><td>${skillsEsc(t.id)}</td><td>${skillsEsc(t.category)}</td>
+          <td>${t.enabled ? '✅' : '⛔'}</td><td class="muted">${skillsEsc(t.enabled ? '' : (t.reason || t.code || ''))}</td></tr>`).join('')}
+      </tbody></table>
+    </details>`;
+
+  box.querySelector('#skills-reload')?.addEventListener('click', async () => {
+    try { await api('/api/skills/reload', { method: 'POST' }); } catch { /* 下面统一重拉 */ }
+    box.dataset.loaded = '0';
+    await loadSkillsView(true);
+  });
+  box.querySelectorAll('[data-skill-toggle]').forEach((el) => {
+    el.addEventListener('change', async () => {
+      try {
+        await api(`/api/skills/${encodeURIComponent(el.dataset.skillToggle)}`, {
+          method: 'POST', body: JSON.stringify({ enabled: el.checked })
+        });
+      } catch (error) {
+        alert(`切换失败：${error?.message ?? error}`);
+      }
+      box.dataset.loaded = '0';
+      await loadSkillsView(true);
+    });
+  });
+  box.querySelectorAll('[data-skill-settings]').forEach((el) => {
+    el.addEventListener('click', () => {
+      el.closest('[data-skill-row]')?.querySelector('.skill-settings')?.classList.toggle('hidden');
+    });
+  });
+  box.querySelectorAll('[data-skill-save]').forEach((el) => {
+    el.addEventListener('click', async () => {
+      const row = el.closest('[data-skill-row]');
+      if (!row) return;
+      const settings = {};
+      row.querySelectorAll('[data-skill-field]').forEach((f) => {
+        const key = f.dataset.skillField;
+        if (f.type === 'checkbox') settings[key] = f.checked;
+        else if (f.type === 'number') settings[key] = f.value === '' ? '' : Number(f.value);
+        else settings[key] = f.value;
+      });
+      el.disabled = true;
+      try {
+        await api(`/api/skills/${encodeURIComponent(el.dataset.skillSave)}`, {
+          method: 'POST', body: JSON.stringify({ settings })
+        });
+        box.dataset.loaded = '0';
+        await loadSkillsView(true);
+      } catch (error) {
+        alert(`保存失败：${error?.message ?? error}`);
+        el.disabled = false;
+      }
+    });
+  });
+}
+
+// ── 实例（多开）页 ───────────────────────────────────────────────────────
+async function loadInstancesView(force = false) {
+  const box = $('#instances-page');
+  if (!box) return;
+  if (!force && box.dataset.loaded === '1') return;
+  box.innerHTML = '<div class="empty-hint">加载中…</div>';
+  try {
+    const data = await api('/api/instances');
+    box.dataset.loaded = '1';
+    renderInstancesView(box, data);
+  } catch (error) {
+    box.innerHTML = `<div class="empty-hint">加载失败：${skillsEsc(error?.message ?? error)}</div>`;
+  }
+}
+
+function renderInstancesView(box, data) {
+  const list = Array.isArray(data?.instances) ? data.instances : [];
+  const supported = data?.supported !== false;
+  const rows = list.map((x) => `
+    <div class="skill-row">
+      <div class="skill-main">
+        <div class="skill-title">${skillsEsc(x.label)} ${x.isSelf
+          ? '<span class="skill-badge ok">当前窗口</span>'
+          : (x.running ? '<span class="skill-badge ok">运行中</span>' : '<span class="skill-badge off">未运行</span>')}
+          <span class="muted skill-meta">${skillsEsc(x.dataDirName)} · 控制台 ${x.port} · OneBot ${x.httpPort}/${x.wsPort}</span>
+        </div>
+        <div class="muted skill-desc">${skillsEsc(x.note || '')}</div>
+      </div>
+      <div class="skill-actions">
+        ${x.canLaunch ? `<button class="btn btn-small" data-inst-launch="${skillsEsc(x.id)}">启动</button>` : ''}
+      </div>
+    </div>`).join('');
+  box.innerHTML = `
+    <div class="skills-head">
+      <div class="skills-summary muted">
+        共 ${data?.total ?? list.length} 个实例，运行中 ${data?.runningCount ?? 0} 个${supported ? '' : '（当前系统不支持多开，仅 Windows）'}
+        <br><span class="muted">程序根：${skillsEsc(data?.root || '')}</span>
+      </div>
+      <div class="skill-actions">
+        <button class="btn btn-small" id="inst-launch-all">全部启动</button>
+        <button class="btn btn-small btn-primary" id="inst-create">新建实例</button>
+      </div>
+    </div>
+    <div class="skills-list">${rows || '<div class="empty-hint">只有主实例。点「新建实例」可以再开一个 QQ 号。</div>'}</div>
+    <div class="skills-head" style="margin-top:16px">
+      <label class="skill-field-label"><input type="checkbox" id="inst-autostart" ${data?.autoStartPeers ? 'checked' : ''} /> 启动主实例时自动带起其它实例</label>
+    </div>`;
+
+  const refresh = async () => { box.dataset.loaded = '0'; await loadInstancesView(true); };
+  box.querySelector('#inst-launch-all')?.addEventListener('click', async () => {
+    const r = await api('/api/instances/launch-all', { method: 'POST' });
+    alert(`已启动 ${r.started?.length || 0} 个${r.failed?.length ? `，失败 ${r.failed.length} 个` : ''}`);
+    await refresh();
+  });
+  box.querySelector('#inst-create')?.addEventListener('click', async () => {
+    const profile = prompt('新实例编号（正整数，如 2）：', data?.nextProfile || '2');
+    if (!profile) return;
+    const name = prompt('实例名称（可留空）：', '') || '';
+    try {
+      await api('/api/instances/create', { method: 'POST', body: JSON.stringify({ profileId: profile, name }) });
+      await refresh();
+    } catch (error) {
+      alert(`新建失败：${error?.message ?? error}`);
+    }
+  });
+  box.querySelectorAll('[data-inst-launch]').forEach((el) => {
+    el.addEventListener('click', async () => {
+      try {
+        await api('/api/instances/launch', { method: 'POST', body: JSON.stringify({ id: el.dataset.instLaunch }) });
+      } catch (error) {
+        alert(`启动失败：${error?.message ?? error}`);
+      }
+      await refresh();
+    });
+  });
+  box.querySelector('#inst-autostart')?.addEventListener('change', async (e) => {
+    try {
+      await api('/api/config', { method: 'POST', body: JSON.stringify({ server: { autoStartPeers: e.target.checked } }) });
+    } catch (error) {
+      alert(`保存失败：${error?.message ?? error}`);
+    }
+  });
+}
+
+// ── 移植层页（情绪 / 情爱 / 棋局 / 临时设定 / 梗库 / 风格库）──────────────
+async function loadPortedView(force = false) {
+  const box = $('#ported-page');
+  if (!box) return;
+  if (!force && box.dataset.loaded === '1') return;
+  box.innerHTML = '<div class="empty-hint">加载中…</div>';
+  try {
+    const data = await api('/api/ported/status');
+    box.dataset.loaded = '1';
+    renderPortedView(box, data);
+  } catch (error) {
+    box.innerHTML = `<div class="empty-hint">加载失败：${skillsEsc(error?.message ?? error)}</div>`;
+  }
+}
+
+function renderPortedView(box, data) {
+  const hooks = data?.hooks || {};
+  const hookNames = {
+    emotion: '情绪', intimacy: '情爱', chess: '棋局', tempSettings: '临时设定',
+    sister: '姐妹', bus: '活动账本', mute: '群禁言'
+  };
+  const hookRow = Object.entries(hookNames).map(([k, label]) =>
+    `<span class="skill-badge ${hooks[k] ? 'ok' : 'off'}">${label}</span>`).join(' ');
+  const emotions = Array.isArray(data?.emotions) ? data.emotions : [];
+  const intimacy = Array.isArray(data?.intimacy) ? data.intimacy : [];
+  const chess = Array.isArray(data?.chess) ? data.chess : [];
+  const temps = Array.isArray(data?.tempSettings) ? data.tempSettings : [];
+  const memes = Array.isArray(data?.memes) ? data.memes : [];
+  const styles = Array.isArray(data?.styles) ? data.styles : [];
+  const activity = Array.isArray(data?.activity) ? data.activity : [];
+
+  const section = (title, bodyHtml) => `
+    <details class="skills-tools"><summary>${title}</summary>${bodyHtml}</details>`;
+  const kv = (rows) => (rows.length
+    ? `<table class="usage-table"><tbody>${rows.join('')}</tbody></table>`
+    : '<div class="muted" style="padding:6px 0">（暂无）</div>');
+  const clearBtn = (kind, key) =>
+    `<button class="btn btn-small" data-ported-clear="${kind}" data-key="${skillsEsc(key)}">清除</button>`;
+
+  box.innerHTML = `
+    <div class="skills-head">
+      <div class="skills-summary muted">
+        移植层开关：${hookRow}
+        <br><span class="muted">开关在「设置 → 扩展功能」里改（emotion/intimacy/chess/tempSettings/sister/bus 各带 enabled）。</span>
+      </div>
+      <button class="btn btn-small" id="ported-refresh">刷新</button>
+    </div>
+    ${section(`情绪（${emotions.length}）`, kv(emotions.map((e) => `<tr><td>${skillsEsc(e.chatKey || '')}</td><td>${skillsEsc(e.name || e.key || '')}</td><td>${skillsEsc(e.intensity ?? '')}</td><td>${clearBtn('emotion', e.chatKey || '')}</td></tr>`)))}
+    ${section(`情爱等级（${intimacy.length}）`, kv(intimacy.map((e) => `<tr><td>${skillsEsc(e.chatKey || '')}</td><td>${skillsEsc(e.value ?? '')}</td><td class="muted">${skillsEsc(e.reason || '')}</td><td>${clearBtn('intimacy', e.chatKey || '')}</td></tr>`)))}
+    ${section(`棋局（${chess.length}）`, kv(chess.map((e) => `<tr><td>${skillsEsc(e.chatKey || '')}</td><td>${skillsEsc(e.status || '')}</td><td class="muted">${skillsEsc(e.movesCount ?? e.plies ?? '')}</td><td>${clearBtn('chess', e.chatKey || '')}</td></tr>`)))}
+    ${section(`临时设定（${temps.length}）`, kv(temps.map((e) => `<tr><td>${skillsEsc(e.groupId || '')}</td><td>${skillsEsc(e.summary || e.text || '')}</td><td class="muted">${e.expiresAt ? new Date(e.expiresAt).toLocaleString('zh-CN', { hour12: false }) : ''}</td><td>${clearBtn('temp', e.groupId || '')}</td></tr>`)))}
+    ${section(`梗库（${memes.length}）/ 风格库（${styles.length}）`, kv(memes.slice(0, 30).map((m) => `<tr><td>${skillsEsc(m.text || '')}</td><td class="muted">${skillsEsc((m.tags || []).join('/'))}</td></tr>`)))}
+    ${section(`活动账本（${activity.length}）`, kv(activity.slice(0, 30).map((a) => `<tr><td class="muted">${a.at ? new Date(a.at).toLocaleTimeString('zh-CN', { hour12: false }) : ''}</td><td>${skillsEsc(a.text || '')}</td></tr>`)))}`;
+
+  const refresh = async () => { box.dataset.loaded = '0'; await loadPortedView(true); };
+  box.querySelector('#ported-refresh')?.addEventListener('click', refresh);
+  box.querySelectorAll('[data-ported-clear]').forEach((el) => {
+    el.addEventListener('click', async () => {
+      const kind = el.dataset.portedClear;
+      const key = el.dataset.key;
+      if (!key) return;
+      if (!confirm(`确定清除 ${key} 的${kind === 'temp' ? '临时设定' : kind}吗？`)) return;
+      try {
+        if (kind === 'emotion') await api('/api/ported/emotion', { method: 'POST', body: JSON.stringify({ chatKey: key, clear: true }) });
+        else if (kind === 'intimacy') await api('/api/ported/intimacy', { method: 'POST', body: JSON.stringify({ chatKey: key, clear: true }) });
+        else if (kind === 'chess') await api('/api/ported/chess', { method: 'POST', body: JSON.stringify({ chatKey: key, action: 'clear' }) });
+        else if (kind === 'temp') await api('/api/ported/temp-setting', { method: 'POST', body: JSON.stringify({ groupId: key, action: 'clear' }) });
+      } catch (error) {
+        alert(`清除失败：${error?.message ?? error}`);
+      }
+      await refresh();
+    });
+  });
+}
 
 // ── 启动 ──
 (async function init() {

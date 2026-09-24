@@ -261,6 +261,12 @@ export function upsertProvider({ baseUrl, apiKey, models = [] }) {
     for (const m of entries) {
       if (!existing.models.includes(m.id)) existing.models.push(m.id);
     }
+    // ⚠️ modelNames 的合并必须在 updateConfig **之前**完成：
+    //   曾经先 updateConfig（内部 structuredClone 出配置快照落盘）、
+    //   再改局部 existing.modelNames —— 返回值（内存对象）带着新名字，
+    //   但 currentConfig 与磁盘上都没有，重启后新增模型的显示名丢失。
+    existing.modelNames = { ...(existing.modelNames || {}) };
+    for (const m of entries) existing.modelNames[m.id] = m.name;
     if (apiKey) {
       const keys = { ...(getConfig().dshProviderKeys || {}) };
       keys[existing.id] = String(apiKey).trim();
@@ -268,8 +274,6 @@ export function upsertProvider({ baseUrl, apiKey, models = [] }) {
     } else {
       updateConfig({ providers });
     }
-    existing.modelNames = { ...(existing.modelNames || {}) };
-    for (const m of entries) existing.modelNames[m.id] = m.name;
     return { provider: withResolvedKey(existing), created: false };
   }
   const id = `custom_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
@@ -321,6 +325,38 @@ export function removeModelFromProvider(providerId, modelId) {
   }
   updateConfig({ providers: providers.map((x) => { const { apiKey, ...rest } = x; return rest; }) });
   return p;
+}
+
+/**
+ * 删除一个提供商（连同它的 Key 与选中态）。
+ *
+ * 两个坑：
+ *   · Key 存在 dshProviderKeys 这个**扁平对象**里，普通深合并传 {} 删不掉已有键，
+ *     必须用 `__replace__` 整体替换，否则被删的 Key 会一直留在配置里。
+ *   · 删掉的正好是当前选中的提供商时，不清空 api.provider/model 的话，
+ *     下次请求会拿着一个不存在的 provider 去发，报错信息还很难看懂。
+ */
+export function removeProvider(providerId) {
+  const pid = String(providerId ?? '').trim();
+  if (!pid) return false;
+  const cfg = getConfig();
+  const providers = (cfg.providers || []).filter((p) => p.id !== pid);
+  if (providers.length === (cfg.providers || []).length) return false;   // 没找到
+
+  // 清掉这个提供商的 Key（__replace__ 整体替换：普通深合并传 {} 删不掉已有键）
+  const keys = { ...(cfg.dshProviderKeys || {}) };
+  delete keys[pid];
+
+  const patch = {
+    providers: { __replace__: providers },
+    dshProviderKeys: { __replace__: keys }
+  };
+  // 当前选中的提供商被删 → 一并清空选中态，回落到"未选择"
+  if (String(cfg.api?.provider ?? '') === pid) {
+    patch.api = { provider: '', model: '' };
+  }
+  updateConfig(patch);
+  return true;
 }
 
 // ── 连通性测试：GET {baseURL}/models（OpenAI 兼容探测） ────────────────────

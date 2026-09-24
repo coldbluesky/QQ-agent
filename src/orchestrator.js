@@ -14,6 +14,22 @@ import { sleep, randInt, createEventBus, todayKey } from './util.js';
 import { buildSystemPrompt, buildUserPrompt, resolveContextTier } from './prompt.js';
 import { chatCompletion, chatCompletionWithRetry, addUsage, isRetryableError } from './llm.js';
 import { buildToolDefs, toOpenAiTools, executeTool } from './tools.js';
+import { getToolAvailability } from './tool-registry.js';
+import { skillManager } from './skills/manager.js';
+import {
+  buildPortedSections, buildPortedContextLines,
+  beforeRun as portedBeforeRun, isLocallyMuted
+} from './agent-hooks.js';
+// ── 群内指令接线 ──
+// admin：管理员在群里喊「禁言/解除」→ 就地执行，不进模型（否则模型会把
+// 「禁言」当聊天接下茬）。temp-settings：群里发「临时设定：… 持续 N 分钟」→ 解析入库 + 回执。
+import { parseAdminCommand, isAdmin, adminEnabled } from './admin.js';
+import { muteGroup, unmuteGroup } from './mute.js';
+import { parseTempCommand, setTempSetting, tempSettingsCfg } from './temp-settings.js';
+// ── 回复安全网（reply-rescue.js）──
+// 把"写在正文里、但没通过工具发出去"的成稿抢救成一条 send_message 调用。
+// 判定逻辑本身是纯逻辑（可被测试直接驱动）；这里只负责注入依赖。
+import { rescueUnsentReply } from './reply-rescue.js';
 import { modelImageVerdict } from './vision-scan.js';
 import { currentProviders } from './providers.js';
 import { voiceReady } from './tts.js';
@@ -24,7 +40,7 @@ import {
 } from './summary.js';
 
 export class Orchestrator {
-  constructor({ store, memory, stickers, sender, sessions, onebot, tts = null, emit = null }) {
+  constructor({ store, memory, stickers, sender, sessions, onebot, tts = null, emit = null, reminders = null, videoReader = null }) {
     this.store = store;
     this.memory = memory;
     this.stickers = stickers;
@@ -32,6 +48,10 @@ export class Orchestrator {
     this.sessions = sessions;
     this.onebot = onebot;
     this.tts = tts;                    // 语音合成器；null = 未启用语音
+    this.reminders = reminders;        // 提醒（闹钟）存储；null = 不启用
+    this.videoReader = videoReader;    // 视频读取服务；null = 不启用
+    this.reminderTimer = null;
+    this.reminderFiring = new Set();
     this.emit = typeof emit === 'function' ? emit : ((b) => b.emit.bind(b))(createEventBus());
     this.toolDefs = buildToolDefs();
 
@@ -48,6 +68,15 @@ export class Orchestrator {
     this.pauseReason = null;
     this.proactiveTimer = null;
     this.aborted = false;
+  }
+
+  /**
+   * 重新拉取工具定义（Skill/插件加载或热重载之后调用）。
+   * 内置工具不会重复注册（buildToolDefs 内部幂等），技能工具则会随之出现/消失。
+   */
+  refreshToolDefs() {
+    this.toolDefs = buildToolDefs();
+    return this.toolDefs.length;
   }
 
   /**
@@ -214,6 +243,116 @@ export class Orchestrator {
     this.emit('session-end', { sessionId, chatKey: s.chatKey, status, error: s.error || null });
   }
 
+  /**
+   * 群内指令：在**进模型之前**拦截并就地执行。
+   *
+   * 两类：
+   *   A. 管理员指令（admin.js）：「禁言」→ 本群静默 + 本轮不再运行；
+   *      「解除」→ 恢复，批里剩下的普通消息照常运行。
+   *   B. 临时设定指令（temp-settings.js）：「临时设定：… 持续 N 分钟」→ 入库 +
+   *      回执（走统一发送管道），指令消息从触发批剔除。
+   *
+   * @returns {Promise<boolean>} true = 本轮已被指令完全消费，调用方直接 return
+   */
+  /** 取某个能力的第一个提供者函数（Skill 未启用时返回 null）。 */
+  #capFirst(name, context = {}) {
+    try {
+      return skillManager.getCapabilityProviders(name, context)[0]?.fn || null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** 给"正文裁判"用的模型参数：沿用当前聊天的主模型，不另开一份配置。 */
+  #judgeApi() {
+    const api = getConfig().api || {};
+    // 密钥解析：模型走 providers 目录时顶层 api.apiKey 常为空 —— 直接取会 401。
+    let apiKey = api.apiKey;
+    if (!apiKey && api.provider) {
+      const p = currentProviders().find((x) => x.id === api.provider);
+      apiKey = p?.apiKey || '';
+    }
+    return { baseUrl: api.baseUrl, apiKey, model: api.model, provider: api.provider };
+  }
+
+  /** 触发批的文本（裁判要知道"这轮收到了什么"，才能判断正文是对它的回复）。 */
+  #triggerText(triggerEntries) {
+    return (triggerEntries || [])
+      .map((e) => String(e?.text || '')).filter(Boolean).join('\n').slice(0, 400);
+  }
+
+  async #handleChatCommands(chatKey, entries, { waitingSessionId = null } = {}) {
+    const groupId = String(chatKey).split(':')[1] || '';
+    if (!groupId || !Array.isArray(entries) || !entries.length) return false;
+    const cfgNow = getConfig();
+
+    // ── A. 管理员指令 ──
+    if (adminEnabled()) {
+      const cmdOf = (e) => {
+        const cmd = parseAdminCommand(e?.text);
+        return cmd && isAdmin(groupId, e?.senderId) ? cmd.cmd : null;
+      };
+      // 「禁言」优先判定：即使同批混着「解除」，也以"最新意图是闭嘴"处理
+      if (entries.some((e) => cmdOf(e) === 'mute')) {
+        const who = entries.find((e) => cmdOf(e) === 'mute');
+        const r = muteGroup(groupId, { by: 'admin', reason: '群内指令', admin: true });
+        console.log(`[admin] 群 ${groupId} 管理员 ${who?.senderName || who?.senderId || '?'} 指令禁言 → ${r.ok ? '已生效' : `失败：${r.error}`}`);
+        if (waitingSessionId) this.#finishWaiting(waitingSessionId, 'aborted', '管理员指令禁言');
+        this.emit('chat-update', chatKey);
+        return true;
+      }
+      if (entries.some((e) => cmdOf(e) === 'unmute')) {
+        const who = entries.find((e) => cmdOf(e) === 'unmute');
+        const r = unmuteGroup(groupId);
+        console.log(`[admin] 群 ${groupId} 管理员 ${who?.senderName || who?.senderId || '?'} 指令解除禁言 → wasMuted=${r.wasMuted}`);
+        // 解除后批里剩下的普通消息照常运行（解除指令本身不进模型）
+        const rest = entries.filter((e) => cmdOf(e) !== 'unmute');
+        entries.splice(0, entries.length, ...rest);
+        if (!rest.length) {
+          if (waitingSessionId) this.#finishWaiting(waitingSessionId, 'aborted', '管理员指令解除禁言');
+          this.emit('chat-update', chatKey);
+          return true;
+        }
+      }
+    }
+
+    // ── B. 临时设定指令 ──
+    const tCfg = tempSettingsCfg(cfgNow.tempSettings);
+    if (tCfg.enabled && tCfg.allowCommand) {
+      // 从后往前剔（splice 安全），同一批多条指令逐条处理、逐条回执
+      for (let i = entries.length - 1; i >= 0; i--) {
+        const e = entries[i];
+        const parsed = parseTempCommand(e?.text);
+        if (!parsed) continue;
+        // 权限：默认仅管理员（本群或 '*' 全局）；信任私群可 commandAllowEveryone
+        if (!tCfg.commandAllowEveryone && !isAdmin(groupId, e?.senderId)) continue;
+        const r = setTempSetting(groupId, {
+          text: parsed.text, ttlMin: parsed.ttlMin, by: 'command',
+          note: `群内指令 by ${e?.senderName || e?.senderId || '?'}`
+        });
+        let reply;
+        if (r?.ok === false) {
+          reply = `临时设定没有生效：${r.error}`;
+        } else {
+          const leftMin = Math.max(1, Math.round((Number(r.item?.expiresAt) - Date.now()) / 60000));
+          const durText = leftMin >= 1440
+            ? `${Math.round((leftMin / 1440) * 10) / 10} 天`
+            : leftMin >= 60
+              ? `${Math.round((leftMin / 60) * 10) / 10} 小时`
+              : `${leftMin} 分钟`;
+          reply = `收到，本群临时设定已生效（约 ${durText}）：${r.item?.summary || parsed.text}`;
+        }
+        try {
+          await this.sender.sendTextBatch(chatKey, [reply]);
+        } catch (error) {
+          console.warn(`[temp-settings] 指令回执发送失败: ${error?.message ?? error}`);
+        }
+        entries.splice(i, 1);   // 指令消息不进模型
+      }
+    }
+    return false;
+  }
+
   /** 手动触发一次处理（UI 按钮）。 */
   forceWake(chatKey) {
     if (this.runningChats.has(chatKey)) return false;
@@ -268,6 +407,15 @@ export class Orchestrator {
     //
     // 未命中时：标记已读、不创建会话、不调模型 —— 这才是省 token 的关键
     // （消息内容仍留在存档里，日后被艾特时会作为"已读历史"带进提示词）。
+    // 群禁言（本地硬闸门）：禁言期间完全不触发 —— 连档位判定都不做。
+    if (!proactive) {
+      const [muteKind, muteId] = String(chatKey).split(':');
+      if (muteKind === 'group' && isLocallyMuted(muteId)) {
+        if (waitingSessionId) this.#discardWaiting(waitingSessionId);
+        return;
+      }
+    }
+
     const cfgNow = getConfig();
     let pendingEntries = [];
     if (!proactive) {
@@ -307,16 +455,28 @@ export class Orchestrator {
       return; // 没有未读就不空跑
     }
 
+    // ── 群内指令：命中则就地处理，指令消息不进模型 ──
+    if (!proactive && await this.#handleChatCommands(chatKey, triggerEntries, { waitingSessionId })) {
+      return;
+    }
+
     // ── 档位：响应时带多少条已读历史 ──
     // 在唤醒时算一次并固定下来（尤其是随机档的骰子结果），
     // 否则后续每次渲染提示词都会重新掷，会话记录与提示词会对不上。
-    const tierResult = resolveContextTier({
-      triggerEntries,
-      selfNickname: cfgNow.persona?.selfNickname || this.onebot.selfNickname || '',
-      botName: cfgNow.persona?.botName || '',
-      selfId: cfgNow.onebot?.selfId || this.onebot.selfId || '',
-      cfg: storeConfigForChat(chatKey)   // 与 #predictTier 同一来源，保证预判/实跑一致
-    });
+    // 两个修复（此前"已读历史偶尔拼接不进提示词"的根源）：
+    //   1. 主动机会没有触发批：resolveContextTier 对空触发批在 1~3 档下判
+    //      "未触发"（count=0）→【过去状态】一条不带，模型在失忆状态下被要求
+    //      主动开话题。proactive 显式按 4 档带 allCount 条已读。
+    //   2. 随机档实跑复用预判钉住的骰子（此处的 triggerEntries 与预判同源）。
+    const tierResult = proactive
+      ? { tier: 4, count: Math.max(0, Number(storeConfigForChat(chatKey).allCount) || 80), reason: '主动机会（带历史）', shouldRespond: true }
+      : resolveContextTier({
+        triggerEntries,
+        selfNickname: cfgNow.persona?.selfNickname || this.onebot.selfNickname || '',
+        botName: cfgNow.persona?.botName || '',
+        selfId: cfgNow.onebot?.selfId || this.onebot.selfId || '',
+        cfg: storeConfigForChat(chatKey)   // 与 #predictTier 同一来源，保证预判/实跑一致
+      });
 
     this.runningChats.add(chatKey);
     const seq = (this.runSeq.get(chatKey) || 0) + 1;
@@ -453,8 +613,51 @@ export class Orchestrator {
     // 曲库快照（提示词 + 工具用）。纯本地清单，读一次即可，不需要网络。
     const songEntries = loadSongLibrary();
 
+    // 工具/技能共享的运行期上下文
+    // 视觉判定 = 全局开关 && 选中模型未被探测为"明确不支持图片"（未探测/unknown 时保持开关行为）
+    const visionEnabled = cfg.api.vision !== false
+      && modelImageVerdict(cfg.api.provider, cfg.api.model) !== 'no-vision';
+    const searchEnabled = cfg.webSearch?.enabled !== false;
+    const skillContext = {
+      chatKey, kind, chatId, chatName,
+      model: cfg.api.model,
+      provider: cfg.api.provider,
+      visionEnabled,
+      searchEnabled,
+      proactive,
+      sessionId: session.id
+    };
+
+    // Skill 生命周期：提示词组装之前先跑 before-context。
+    // 注意 hook 只能**追加/加工上下文**；安全规则、工具协议等核心提示词由 prompt.js 独占
+    // （Skill 无法覆盖，manifest priority 上限 99）。
+    try {
+      await skillManager.runHook('before-context', {
+        ...skillContext,
+        triggerEntries,
+        store: this.store,
+        memory: this.memory
+      });
+    } catch (error) {
+      skillManager.recordError('before-context', error);
+    }
+
+    // 移植层（agent-hooks）：把"我方已有"的状态化能力接到编排流程上。
+    // 每一块都依赖各自的开关，关掉就与没有这些模块时完全一致。
+    const triggerTextForHooks = triggerEntries
+      .map((m) => `${m.senderName || m.senderId}: ${String(m.text || '').slice(0, 80)}`).join(' | ').slice(0, 500);
+    try {
+      portedBeforeRun({ chatKey, kind, chatId, triggerText: triggerTextForHooks });
+    } catch (error) {
+      console.warn('[agent-hooks] beforeRun 失败:', error?.message ?? error);
+    }
+    const portedSections = (() => {
+      try { return buildPortedSections({ chatKey, kind, chatId, triggerText: triggerTextForHooks }); }
+      catch { return []; }
+    })();
+
     // 组装提示词（无 LLM 历史）
-    const systemPrompt = buildSystemPrompt();
+    const systemPrompt = buildSystemPrompt({ skillContext, extraSections: portedSections });
     const userPrompt = buildUserPrompt({
       chatKey, kind, chatId, chatName,
       triggerEntries,
@@ -477,9 +680,16 @@ export class Orchestrator {
       summaryText: cfg.summary?.enabled === false ? '' : loadSummary(chatKey).text
     });
 
+    // 移植层动态块（bus 活动等）放在用户提示末尾 —— 变化频率高的内容靠后，保护前缀缓存
+    const portedLines = (() => {
+      try { return buildPortedContextLines({ chatKey, kind, chatId }); }
+      catch { return []; }
+    })();
+    const userPromptFull = portedLines.length ? `${userPrompt}\n\n${portedLines.join('\n\n')}` : userPrompt;
+
     session.systemPrompt = systemPrompt;
-    session.userPrompt = userPrompt;
-    session.promptChars = systemPrompt.length + userPrompt.length;
+    session.userPrompt = userPromptFull;
+    session.promptChars = systemPrompt.length + userPromptFull.length;
     session.model = cfg.api.model;
     // 记录本次调用走的是哪个渠道（A6API / openrouter / 本地中转…）。
     // 同名模型在不同渠道是不同商品，用量与价格要分开统计。
@@ -497,33 +707,48 @@ export class Orchestrator {
     const messages = [
       { role: 'system', content: systemPrompt },
       { role: 'user', content: proactive
-        ? `${userPrompt}\n\n【本次唤醒】（主动机会）群里已经安静了一会儿。你可以主动抛一个自然的话题（像随口说的，不要像播报），也可以判断没必要说话就安静结束。`
-        : userPrompt }
+        ? `${userPromptFull}\n\n【本次唤醒】（主动机会）群里已经安静了一会儿。你可以主动抛一个自然的话题（像随口说的，不要像播报），也可以判断没必要说话就安静结束。`
+        : userPromptFull }
     ];
+    // 让 Skill 加工即将发给模型的消息（如补充知识库片段）。
+    // hook 拿到的是同一个数组引用，允许原地修改，返回值忽略。
+    try {
+      await skillManager.runHook('before-llm-messages', { ...skillContext, messages });
+    } catch (error) {
+      skillManager.recordError('before-llm-messages', error);
+    }
+
     // JSON 模式需要看到输入给模型的完整 messages（去工具之前）
     session.inputMessages = structuredClone(messages.map((m) => ({ role: m.role, content: m.content })));
     this.sessions.update(session.id);
 
-    // 工具集按配置过滤：无视觉模型 → 移除看图工具；搜索关闭 → 移除联网工具
-    // 视觉判定 = 全局开关 && 选中模型未被探测为"明确不支持图片"（未探测/unknown 时保持开关行为）
-    const visionEnabled = cfg.api.vision !== false
-      && modelImageVerdict(cfg.api.provider, cfg.api.model) !== 'no-vision';
-    const searchEnabled = cfg.webSearch?.enabled !== false;
+    // 工具集按配置过滤（visionEnabled / searchEnabled 已在上面为 skillContext 算好）：
+    // 无视觉模型 → 移除看图工具；搜索关闭 → 移除联网工具。
     // 语音：开关打开、真的注入了合成器、且配置完整（选好模型/凭证）才给工具。
-    // 少了任一条件都不注册 —— 否则模型每次调用都撞一个必然失败的报错，白烧 token；
-    // 缺什么设置页已经明确提示了。
+    // 少了任一条件都不注册 —— 否则模型每次调用都撞一个必然失败的报错，白烧 token。
     const voiceEnabled = cfg.voice?.enabled === true && Boolean(this.tts) && voiceReady().ok;
     // 曲库：开关 + 有歌 + 装了 ffmpeg 三者齐备才注册 sing / list_songs。
-    // 缺 ffmpeg 是最容易踩的（它是个系统依赖），这里判掉能让模型完全不知道有唱歌这回事，
-    // 而不是每次调用都撞一条"未安装 ffmpeg"。缺什么设置页会显示。
+    // 缺 ffmpeg 是最容易踩的（它是个系统依赖），这里判掉能让模型完全不知道有唱歌这回事。
     const songState = songsStatus(songEntries);
+    // 被排除的工具与原因（UI 排障可见：为什么这个工具没给模型）
+    const excludedTools = [];
     const toolDefs = this.toolDefs.filter((d) => {
       if (!visionEnabled && (d.name === 'get_message_images' || d.name === 'get_sticker_image')) return false;
       if (!searchEnabled && (d.name === 'web_search' || d.name === 'web_fetch')) return false;
       if (!voiceEnabled && d.name === 'send_voice') return false;
       if (!songState.ok && (d.name === 'sing' || d.name === 'list_songs')) return false;
+      // Skill 层（统一口径）：所属技能是否生效 / 能力依赖 / 分类开关 / 单工具开关 / tool.guard
+      const av = getToolAvailability(d.id ?? d.name, {
+        skills: skillManager,
+        toolsCfg: cfg.tools || {},
+        visionEnabled,
+        searchEnabled,
+        runtimeContext: { chatKey, kind, chatId, sessionId: session.id }
+      });
+      if (!av.enabled) { excludedTools.push({ id: d.id ?? d.name, code: av.code, reason: av.reason }); return false; }
       return true;
     });
+    session.excludedTools = excludedTools;
     const openAiTools = toOpenAiTools(toolDefs);
 
     const ctx = {
@@ -538,6 +763,8 @@ export class Orchestrator {
       sender: this.sender,
       tts: voiceEnabled ? this.tts : null,
       songs: songState.ok ? songEntries : [],
+      reminders: this.reminders,
+      videoReader: this.videoReader,
       session,
       emit: (type, payload) => this.emit(type, payload)
     };
@@ -556,7 +783,26 @@ export class Orchestrator {
       if (this.aborted) { this.sessions.finish(session.id, 'aborted'); return; }
       markActivity('正在思考…');
       // 网络抖动/5xx/429 会自动重试（同一轮请求，messages 不变，幂等不重复发言）
-      const response = await chatCompletionWithRetry({ messages, tools: openAiTools });
+      // ── 剩余轮次提醒：防止"工具轮次耗尽导致想说的话发不出去"──
+      // 进入最后 3 轮且还一条消息都没发时，往对话里注入一条系统提醒，
+      // 明确告诉模型"轮次快用完了，现在就该用 send_message 把话说出来"。
+      // 没有这个提醒时，模型常把轮次花在搜索/看图上，循环一断消息就丢了。
+      // 已发出过消息则不打扰（模型可能只是收尾查询，别催它重复发言）。
+      const roundsLeft = maxRounds - round;
+      if (roundsLeft <= 3 && roundsLeft > 0 && session.sent.length === 0
+          && messages[messages.length - 1]?.role !== 'system') {
+        messages.push({
+          role: 'user',
+          content: `【系统提醒】工具调用轮次只剩 ${roundsLeft} 轮。如果你打算回应本次消息，请立刻调用 send_message 把要说的话发出去，不要再调用其它工具 —— 轮次耗尽后你将没有机会发言，群友会收不到任何内容。`
+        });
+      }
+      const response = await chatCompletionWithRetry({ messages, tools: openAiTools, skillContext });
+      // 拿到响应后让 Skill 加工（提取 reasoning / 记录降级等）
+      try {
+        await skillManager.runHook('after-response', { ...skillContext, response, session });
+      } catch (error) {
+        skillManager.recordError('after-response', error);
+      }
       session.model = response.model || session.model;
       addUsage(session.usage, response.usage);
       session.usage.calls += 1;
@@ -620,8 +866,43 @@ export class Orchestrator {
         this.emit('session-update', session.id);
       }
       if (!toolCalls.length) {
-        // 没有工具调用 = 模型结束思考（文本不会发给 QQ）
-        break;
+        // 没有原生工具调用。两种可能：
+        //   · 模型真的说完了（文本只是思考，按设计不发 QQ）→ 正常结束
+        //   · 模型不遵守工具协议，把要说的话写在了正文里 → 群友什么都收不到
+        // 给回复安全网一次机会抢救后者（插件未启用时立刻返回空，行为完全不变）。
+        let rescued = [];
+        try {
+          rescued = await rescueUnsentReply({
+            text: rawContent,
+            trigger: this.#triggerText(triggerEntries),
+            sent: session.sent || [],
+            api: this.#judgeApi(),
+            cap: (name) => this.#capFirst(name, skillContext),
+            log: (message) => skillManager.recordError('reply-safety', message)
+          });
+        } catch (error) {
+          skillManager.recordError('reply-safety', error);
+        }
+        if (!rescued.length) break;
+
+        toolCalls = rescued;
+        // 把 assistant 条目改成 tool_calls 形态：不这么做的话，下面 push 进去的
+        // tool 消息就没有对应的 tool_call，下一轮请求会被判为非法消息序列。
+        const lastRescue = messages[messages.length - 1];
+        if (lastRescue?.role === 'assistant') {
+          lastRescue.content = null;
+          lastRescue.tool_calls = toolCalls;
+        }
+        const liveRescue = this.sessions.current.get(session.id);
+        const uiRescue = liveRescue?.messages?.[liveRescue.messages.length - 1];
+        if (uiRescue?.role === 'assistant') {
+          uiRescue.content = null;
+          uiRescue.tool_calls = structuredClone(toolCalls);
+          uiRescue.inlineParsed = true;
+          uiRescue.rescued = true;
+        }
+        this.sessions.update(session.id);
+        this.emit('session-update', session.id);
       }
 
       const toolResults = [];
@@ -638,29 +919,59 @@ export class Orchestrator {
         if (name === 'web_search' || name === 'web_fetch') webSearchCount += 1;
         session.webSearchCount = webSearchCount;
         markActivity(`正在调用 ${name}…`);
-        const result = await executeTool(toolDefs, ctx, name, argsRaw);
+        // ── 工具执行前后钩子 ──
+        // before-tool 可以**否决**一次调用（返回 { block:true, reason }）——
+        // 用于"Skill 运行期发现不该执行"的场景（如知识库索引未就绪）。
+        // 注意：否决只是拒绝这一次调用，不会绕过发送队列/限频/存档。
+        let blocked = null;
+        try {
+          const hookResults = await skillManager.runHook('before-tool', {
+            ...skillContext, toolName: name, argsRaw, session
+          });
+          blocked = hookResults.map((r) => r.value).find((v) => v && v.block) || null;
+        } catch (error) {
+          skillManager.recordError('before-tool', error);
+        }
+        const result = blocked
+          ? { content: `错误：${blocked.reason || '该工具调用被 Skill 拒绝'}`, isError: true }
+          : await executeTool(toolDefs, ctx, name, argsRaw);
+        try {
+          await skillManager.runHook('after-tool', {
+            ...skillContext, toolName: name, argsRaw, result, session
+          });
+        } catch (error) {
+          skillManager.recordError('after-tool', error);
+        }
         // 工具结果：文本走 tool 消息；图片（parts 数组）不能塞进 tool 消息——
         // 很多 OpenAI 兼容端点不接受。做法：tool 消息只带文本，图片随后以 user 消息补发
         // （[{type:'text'},{type:'image_url'}]），这是兼容面最广的视觉输入方式。
         let contentStr = '';
-        let images = [];
+        let media = [];
         if (Array.isArray(result.content)) {
           contentStr = result.content.filter((p) => p.type === 'text').map((p) => p.text).join('\n');
-          images = result.content.filter((p) => p.type === 'image_url');
+          // image_url 与 video_url 都要收：视频抽帧走前者，全模态原生读视频走后者。
+          // 以前只 filter image_url，video_url 会被静默丢掉（模型只拿到「已发送视频输入」的说明文字）。
+          media = result.content.filter((p) => p.type === 'image_url' || p.type === 'video_url');
         } else {
           contentStr = String(result.content);
         }
         toolResults.push({ role: 'tool', tool_call_id: call.id, name, content: contentStr, isError: !!result.isError });
         session.messages.push({ toolCall: { name, args: safeParse(argsRaw), result: contentStr.slice(0, 2000), isError: !!result.isError } });
-        if (images.length) {
+        if (media.length) {
+          const imgCount = media.filter((p) => p.type === 'image_url').length;
+          const vidCount = media.filter((p) => p.type === 'video_url').length;
+          const what = [
+            imgCount ? `${imgCount} 张图片` : '',
+            vidCount ? `${vidCount} 段视频` : ''
+          ].filter(Boolean).join(' + ');
           imageUserMessages.push({
             role: 'user',
             content: [
-              { type: 'text', text: `[系统：以下是工具 ${name} 返回的 ${images.length} 张图片，请直接"看图"回应]` },
-              ...images
+              { type: 'text', text: `[系统：以下是工具 ${name} 返回的 ${what}，请直接"看"了回应]` },
+              ...media
             ]
           });
-          session.messages.push({ toolImages: { tool: name, count: images.length } });
+          session.messages.push({ toolImages: { tool: name, count: media.length, images: imgCount, videos: vidCount } });
         }
         this.sessions.update(session.id);
         this.emit('session-update', session.id);
@@ -707,6 +1018,58 @@ export class Orchestrator {
       }
     } catch { /* 拿不到就用群号 */ }
     return '';
+  }
+
+  // ── 提醒（闹钟/计时）调度 ─────────────────────────────────────────────
+
+  /** 启动提醒调度循环：每 20 秒检查一次到点的提醒并触发。 */
+  startReminderLoop() {
+    this.stopReminderLoop();
+    if (!this.reminders) return;
+    const tick = async () => {
+      if (this.aborted) return;
+      try {
+        const dueList = this.reminders.due(Date.now());
+        for (const r of dueList) {
+          if (this.reminderFiring.has(r.id)) continue;
+          this.reminderFiring.add(r.id);
+          try {
+            // 发送成功后才标记 fired；失败保留未触发状态，下一轮重试。
+            // （反过来"先标记再发"会让 OneBot 断线/进程崩溃时的提醒永久丢失）
+            await this.#fireReminder(r);
+            this.reminders.markFired(r.id);
+          } catch (error) {
+            console.error('[reminder] 触发失败，将在下一轮重试:', error?.message ?? error);
+          } finally {
+            this.reminderFiring.delete(r.id);
+          }
+        }
+        if (dueList.length) this.reminders.prune();
+      } catch (error) {
+        console.error('[reminder] 调度出错:', error?.message ?? error);
+      }
+      this.reminderTimer = setTimeout(() => { tick().catch(() => {}); }, 20000);
+    };
+    this.reminderTimer = setTimeout(() => { tick().catch(() => {}); }, 5000);   // 启动 5s 后第一次检查
+  }
+
+  stopReminderLoop() {
+    if (this.reminderTimer) { clearTimeout(this.reminderTimer); this.reminderTimer = null; }
+  }
+
+  /** 触发一条提醒：往对应群/私聊发一条提醒消息（走正常发送管道，留档）。 */
+  async #fireReminder(r) {
+    const [kind, id] = String(r.chatKey || '').split(':');
+    if (!kind || !id) return;
+    const text = `⏰ 提醒：${r.text}`;
+    // 走统一发送管道（SendQueue）：与机器人发言共享限频 / 去重 / 超长切分 / CQ 转义，
+    // 并自带留档（appendSelf）。失败必须向上抛，让调度循环保留未触发状态以便重试。
+    await this.sender.sendTextBatch(r.chatKey, [text]).then((result) => {
+      if (result?.sent?.some((s) => s?.deduped)) {
+        console.warn(`[reminder] 提醒文本与刚发送的内容完全相同，被去重跳过（${r.chatKey}）`);
+      }
+    });
+    this.emit('chat-update', r.chatKey);
   }
 
   // ── 主动开话题 ─────────────────────────────────────────────────────────

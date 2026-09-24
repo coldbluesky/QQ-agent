@@ -132,19 +132,46 @@ export function formatStickerList(entries, query = '', limit = 48) {
 }
 
 /** 提示词里的【可用表情包】摘要（不暴露完整 URL，控制上下文体积）。 */
-export function buildStickerContext(entries, max = 10) {
+export function buildStickerContext(entries, max = 10, { rotatePeriodMin = 60, now = Date.now(), withId = Number(max) <= 15 } = {}) {
   const list = (Array.isArray(entries) ? entries : []).map(normalizeStickerEntry).filter(Boolean);
   if (!list.length) return '';
-  const top = [...list]
-    .sort((a, b) => (b.useCount || 0) - (a.useCount || 0) || ((b.desc || b.localNote) ? 1 : 0) - ((a.desc || a.localNote) ? 1 : 0))
-    .slice(0, Math.max(1, Math.min(30, Number(max) || 10)));
-  const lines = top.map((e) => {
+  const total = Math.max(1, Math.min(30, Number(max) || 10));
+  const byUse = [...list].sort((a, b) =>
+    (b.useCount || 0) - (a.useCount || 0)
+    || ((b.desc || b.localNote) ? 1 : 0) - ((a.desc || a.localNote) ? 1 : 0)
+    || String(a.id).localeCompare(String(b.id))
+  );
+  let selected = byUse.slice(0, total);
+
+  if (Number(rotatePeriodMin) > 0 && list.length > total) {
+    const stableCount = Math.max(1, Math.floor(total / 2));
+    const stable = byUse.slice(0, stableCount);
+    const stableIds = new Set(stable.map((e) => e.id));
+    const pool = [...list].filter((e) => !stableIds.has(e.id)).sort((a, b) => String(a.id).localeCompare(String(b.id)));
+    const period = Number(rotatePeriodMin) * 60000;
+    const round = Math.floor(Number(now) / period);
+    // 按轮次播种的 Fisher-Yates：同一轮次结果稳定，既利于缓存命中也便于测试断言。
+    // seed=0 时 xorshift 恒输出 0（j 恒为 0，洗牌失效）——用黄金比例常数兜底。
+    let seed = round >>> 0;
+    for (const e of pool) for (const ch of e.id) seed = (seed * 31 + ch.charCodeAt(0)) >>> 0;
+    if (seed === 0) seed = 0x9e3779b9;
+    const shuffled = [...pool];
+    for (let i = shuffled.length - 1; i > 0; i--) {
+      seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5; seed >>>= 0;
+      const j = seed % (i + 1);
+      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
+    selected = [...stable, ...shuffled.slice(0, total - stableCount)];
+  }
+
+  const lines = selected.map((e) => {
     const label = e.desc || e.localNote || '（无备注，可先看图）';
     const extra = e.tags?.length ? ` [${e.tags.join('/')}]` : '';
     const used = e.useCount ? `（用过${e.useCount}次）` : '';
-    return `- ${label}${extra}${used}`;
+    const id = withId ? ` id=${e.id}` : '';
+    return `- ${label}${extra}${used}${id}`;
   });
-  return `【可用表情包】你的 QQ 收藏表情里有 ${list.length} 个表情（以下为常用/有备注的 ${top.length} 个，完整列表可用 list_stickers 查询）：\n${lines.join('\n')}`;
+  return `【可用表情包】你的 QQ 收藏表情里有 ${list.length} 个表情（以下为常用/轮换的 ${selected.length} 个，完整列表可用 list_stickers 查询）：\n${lines.join('\n')}`;
 }
 
 /** 发送前的表情包策略提示（软策略）。 */

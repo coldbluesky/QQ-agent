@@ -1,0 +1,41 @@
+{
+  "id": "speaker-identity",
+  "name": "发言人身份标注",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "category": "message",
+  "description": "给每条消息标上稳定的 QQ 号身份，避免改名/同名导致的误判，并纠正正文里的 @ 写法。",
+  "author": "QQ Agent",
+  "enabledByDefault": true,
+  "capabilities": [
+    "message.speaker-format",
+    "message.inline-at-normalize"
+  ],
+  "requires": [],
+  "settings": {
+    "includeInHistory": true,
+    "normalizeInlineAt": true
+  },
+  "configSchema": {
+    "includeInHistory": {
+      "type": "boolean",
+      "label": "历史消息带 QQ 号",
+      "description": "开启后每条历史消息显示为 名字(QQ:123456)，让模型能区分改名与同名。"
+    },
+    "normalizeInlineAt": {
+      "type": "boolean",
+      "label": "纠正正文 @ 写法",
+      "description": "把正文里写成 @昵称 的提醒改写成规范写法；关闭则原样保留。"
+    }
+  },
+  "prompt": {
+    "sections": [
+      {
+        "id": "speaker-stable-id",
+        "title": "发言人身份",
+        "priority": 80,
+        "content": "消息里的 QQ 号是稳定身份标识，昵称/群名片随时可能改。判断\"是不是同一个人\"一律看 QQ 号，不要只看名字。两个人名字相同不等于同一个人。"
+      }
+    ]
+  }
+}

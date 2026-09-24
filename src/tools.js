@@ -6,10 +6,15 @@
 import { getConfig } from './config.js';
 import { normalizeMessageList, unquoteJsonString } from './util.js';
 import { formatStickerList } from './stickers.js';
+import { localStickerPath } from './sticker-manager.js';
 import { formatSongList, findSong, clipSong } from './songs.js';
-import { validateImageUrl, safeFetchBinary } from './safe-fetch.js';
+import { validateImageUrl, safeFetchBinary, browseLockState, checkBrowseLock } from './safe-fetch.js';
 import { webSearch, webFetch } from './web-search.js';
+import { holidayOn, upcomingHoliday } from './holidays.js';
+import { skillManager } from './skills/manager.js';
 import { expandForwardNodes } from './onebot.js';
+import { registerTool, listTools } from './tool-registry.js';
+import { registerPortedTools } from './tools-ported.js';
 
 async function downloadImageAsDataUrl(url, timeoutMs = 30000) {
   const safeUrl = await validateImageUrl(url);
@@ -71,8 +76,34 @@ function imageParts(text, dataUrls) {
  *   emit  (事件上报给 UI/日志)
  * }
  */
-export function buildToolDefs() {
-  return [
+/** 解析 "HH:MM" 或 "YYYY-MM-DD HH:MM" 为时间戳；解析不了返回 null。 */
+function parseAtTime(raw) {
+  const s = String(raw || '').trim();
+  // YYYY-MM-DD HH:MM；严格校验边界，避免 Date 把 2 月 31 日归一化成 3 月 3 日
+  let m = /^(\d{4})-(\d{1,2})-(\d{1,2})[ T](\d{1,2}):(\d{2})$/.exec(s);
+  if (m) {
+    const year = Number(m[1]), month = Number(m[2]), day = Number(m[3]);
+    const hour = Number(m[4]), minute = Number(m[5]);
+    const d = new Date(year, month - 1, day, hour, minute, 0, 0);
+    if (month < 1 || month > 12 || hour > 23 || minute > 59
+      || d.getFullYear() !== year || d.getMonth() !== month - 1 || d.getDate() !== day
+      || d.getHours() !== hour || d.getMinutes() !== minute) return null;
+    return d.getTime();
+  }
+  // HH:MM（今天；若已过则明天）
+  m = /^(\d{1,2}):(\d{2})$/.exec(s);
+  if (m) {
+    const hour = Number(m[1]), minute = Number(m[2]);
+    if (hour > 23 || minute > 59) return null;
+    const now = new Date();
+    const d = new Date(now.getFullYear(), now.getMonth(), now.getDate(), hour, minute, 0, 0);
+    if (d.getTime() <= Date.now()) d.setDate(d.getDate() + 1);   // 今天已过 → 明天
+    return d.getTime();
+  }
+  return null;
+}
+
+const BUILTIN_TOOL_DEFS = [
     {
       name: 'send_message',
       description: '发送消息到当前聊天（本工具只能发到本次会话对应的群/私聊）。messages 传字符串=发一条；传字符串数组=分多条发送（推荐，更像真人）。只有需要明确"我回的是哪条"时才传 replyToMessageId 引用；需要点名某人才传 atUserId。不要在字符串内部用空格分句。',
@@ -117,13 +148,28 @@ export function buildToolDefs() {
       },
       async execute(ctx, args) {
         try {
-          const sticker = await ctx.stickers.find(unquoteJsonString(args.stickerId));
+          let sticker = await ctx.stickers.find(unquoteJsonString(args.stickerId));
           if (!sticker) return err(`找不到表情 ${args.stickerId}，请先用 list_stickers 获取有效 id`);
           if (!sticker.url) return err(`表情 ${sticker.id} 没有可发送的图片地址`);
-          try {
-            await validateImageUrl(sticker.url); // 只允许公网 http(s)，防止本地库被污染后诱导 OneBot 抓内网
-          } catch (error) {
-            return err(`表情 ${sticker.id} 的图片地址不合法，已拒绝发送：${error?.message ?? error}`);
+          // 发送前预检：http 直链（QQ 图床 rkey ~1 小时过期）尽量升级成本地转存，
+          // 失败则交给 sender 的三级回退链。本地转存过的条目直通。
+          if (typeof ctx.stickers.ensureSendable === 'function') {
+            sticker = await ctx.stickers.ensureSendable(sticker);
+          }
+          // 本地收藏图片（file:/// 路径，收藏时已转存）不走公网 URL 校验，
+          // 但必须落在受控的 data/sticker-images/ 目录内 —— 本地库条目若被污染
+          // 指向任意本地文件（配置、密钥），不设闸就会被 OneBot 发出去。
+          const isLocalFile = String(sticker.url).startsWith('file:///');
+          if (isLocalFile) {
+            if (!localStickerPath(sticker.url)) {
+              return err(`表情 ${sticker.id} 的本地图片路径不在受控收藏目录内，已拒绝发送`);
+            }
+          } else {
+            try {
+              await validateImageUrl(sticker.url); // 只允许公网 http(s)，防止本地库被污染后诱导 OneBot 抓内网
+            } catch (error) {
+              return err(`表情 ${sticker.id} 的图片地址不合法，已拒绝发送：${error?.message ?? error}`);
+            }
           }
           const result = await ctx.sender.sendSticker(ctx.chatKey, sticker, {
             replyToMessageId: args.replyToMessageId ?? null,
@@ -320,9 +366,14 @@ export function buildToolDefs() {
         try {
           const entry = ctx.store.findByMid(ctx.chatKey, args.messageId);
           if (!entry) return err(`在当前会话找不到消息 ${args.messageId}。${midHint(ctx)}`);
-          const imageMedia = (entry.media || []).find((m) => m.kind === 'image' && m.url);
+          const imageMedia = (entry.media || []).find((m) => m.kind === 'image' && (m.url || m.file));
           if (!imageMedia) return err('该消息没有可收藏的图片');
-          const saved = ctx.stickers.collect(args.messageId, { url: imageMedia.url, note: String(args.note ?? '') });
+          // collect 现在会把图片转存到本地（防 QQ 图床 rkey 过期导致发送失败），是异步的
+          const saved = await ctx.stickers.collect(args.messageId, {
+            url: imageMedia.url || '',
+            file: imageMedia.file || '',
+            note: String(args.note ?? '')
+          });
           return ok({ collected: true, id: saved.id, note: saved.localNote });
         } catch (error) {
           return err(error?.message ?? error);
@@ -592,7 +643,9 @@ export function buildToolDefs() {
       },
       async execute(ctx, args) {
         try {
-          const result = await webFetch(String(args.url ?? ''));
+          // 浏览锁定开启时逐跳校验白名单（与图片下载同一口径；
+          // 曾经漏传导致锁定形同虚设）
+          const result = await webFetch(String(args.url ?? ''), { browseLocked: browseLockState().enabled });
           const body = String(result.body || '');
           return ok({
             url: result.url,
@@ -617,8 +670,457 @@ export function buildToolDefs() {
         ctx.session.finishReason = String(args.summary ?? '').slice(0, 300);
         return ok({ finished: true });
       }
+    },
+    // ── 跨会话发送 / 会话枚举 ──
+    {
+      name: 'send_to',
+      category: 'messaging',
+      icon: '📨',
+      // 描述动态化：开关关闭时明确说"没权限"，避免模型白试一次
+      get description() {
+        const cross = getConfig().tools?.crossChatSend === true;
+        const base = '把消息发送到另一个群/私聊（不在当前会话里说，而是去别处说）。适用于：有人明确让你转告某人/某群、你主动去私聊某人。';
+        return cross
+          ? `${base}先用 get_chats 查可用的 chatKey，再传 targetChatKey（形如 group:123 / private:456）。只在有明确理由时使用，不要骚扰别人。`
+          : `${base}（当前未开启：管理员可在 设置 → 工具与技能 打开「允许跨会话发送」。）`;
+      },
+      parameters: {
+        type: 'object',
+        properties: {
+          targetChatKey: { type: 'string', description: '目标会话：group:群号 / private:QQ号（用 get_chats 查，不要自己编）' },
+          messages: { description: '要发送的内容：字符串=一条；数组=分多条', oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }] }
+        },
+        required: ['targetChatKey', 'messages']
+      },
+      async execute(ctx, args) {
+        try {
+          // 硬校验三连：开关 → 格式 → 白名单。描述里的引导不是安全边界。
+          if (getConfig().tools?.crossChatSend !== true) {
+            return err('跨会话发送未开启（管理员可在 设置 → 工具与技能 里打开）。');
+          }
+          const wantTarget = String(args.targetChatKey ?? '').trim();
+          if (!/^(group|private):\d+$/.test(wantTarget)) {
+            return err('targetChatKey 格式应为 group:群号 或 private:QQ号');
+          }
+          if (wantTarget === ctx.chatKey) {
+            return err(`目标 ${wantTarget} 就是当前会话，直接用 send_message 即可。`);
+          }
+          const [tKind, tId] = wantTarget.split(':');
+          const allow = getConfig().allow || {};
+          const allowList = (tKind === 'group' ? allow.groups : allow.private) || [];
+          const allowedAll = tKind === 'group' ? (allowList.length === 0 && getConfig().allowAllWhenEmpty === true) : (allowList.length === 0);
+          if (!(allowList.map(String).includes(tId) || allowedAll)) {
+            return err(`目标 ${wantTarget} 不在白名单内，不能发送。`);
+          }
+          const messages = normalizeMessageList(args.messages);
+          if (!messages.length) return err('消息内容为空');
+          const result = await ctx.sender.sendTextBatch(wantTarget, messages, {});
+          ctx.session.sent.push(...result.sent.map((s) => ({ type: 'text', text: s.text, to: wantTarget })));
+          ctx.emit('session-update', ctx.session.id);
+          const note = [`已发送到 ${wantTarget}。不要输出汇报。`];
+          if (result.failed.length) note.push(`（另有 ${result.failed.length} 条发送失败：${result.failed.map((f) => f.error).join('；')}）`);
+          return ok({ sent: result.sent.length, messageIds: result.sent.map((s) => s.messageId), note: note.join('') });
+        } catch (error) {
+          return err(error?.message ?? error);
+        }
+      }
+    },
+    {
+      name: 'get_chats',
+      category: 'query',
+      icon: '📋',
+      description: '列出机器人参与的会话（chatKey、名字、最近消息时间）。跨会话发送（send_to 的 targetChatKey）前用它查目标。',
+      parameters: {
+        type: 'object',
+        properties: { limit: { type: 'integer', description: '默认 20，最大 50' } }
+      },
+      async execute(ctx, args) {
+        const limit = Math.min(50, Math.max(1, Number(args?.limit) || 20));
+        const chats = ctx.store.listChats()
+          .map((key) => ({ key, ...(ctx.store.getChatMeta(key) || {}) }))
+          .sort((a, b) => (b.lastTs || 0) - (a.lastTs || 0))
+          .slice(0, limit);
+        return ok({
+          count: chats.length,
+          chats: chats.map((c) => ({
+            chatKey: c.key,
+            lastActive: c.lastTs ? new Date(c.lastTs).toLocaleString('zh-CN', {
+              hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit'
+            }) : '',
+            recentText: String(c.lastText || '').slice(0, 30)
+          }))
+        });
+      }
+    },
+    // ── 提醒（闹钟/计时）──
+    {
+      name: 'set_reminder',
+      category: 'system',
+      icon: '⏰',
+      description: '设置一个定时提醒（闹钟）。到点后机器人会在当前群里主动发一条提醒消息。适用：群友说"X分钟后提醒我"、"明天早上叫我"、"X点提醒我吃饭"。delayMinutes（多少分钟后）和 atTime（具体时间，如"18:30"或"2026-09-12 08:00"）二选一。',
+      parameters: {
+        type: 'object',
+        properties: {
+          text: { type: 'string', description: '提醒内容（到点要发的话，如"该吃饭了"）' },
+          delayMinutes: { type: 'number', description: '多少分钟后提醒（与 atTime 二选一）' },
+          atTime: { type: 'string', description: '具体时间提醒，格式 "HH:MM"（今天/明天）或 "YYYY-MM-DD HH:MM"（与 delayMinutes 二选一）' }
+        },
+        required: ['text']
+      },
+      async execute(ctx, args) {
+        const text = String(args.text ?? '').trim();
+        if (!text) return err('提醒内容为空');
+        let dueAt = null;
+        if (args.delayMinutes != null && Number(args.delayMinutes) > 0) {
+          dueAt = Date.now() + Number(args.delayMinutes) * 60000;
+        } else if (args.atTime) {
+          dueAt = parseAtTime(String(args.atTime));
+          if (!dueAt) return err('时间格式不对：用 "HH:MM"（如 18:30）或 "YYYY-MM-DD HH:MM"');
+          if (dueAt <= Date.now()) return err('这个时间已经过了，请给个未来的时间');
+        } else {
+          return err('请提供 delayMinutes（多少分钟后）或 atTime（具体时间）之一');
+        }
+        if (!ctx.reminders) return err('提醒服务未启用');
+        const entry = ctx.reminders.add({ chatKey: ctx.chatKey, text, dueAt, createdBy: String(ctx.selfId || '') });
+        const when = new Date(dueAt);
+        const whenStr = `${when.getMonth() + 1}月${when.getDate()}日 ${String(when.getHours()).padStart(2, '0')}:${String(when.getMinutes()).padStart(2, '0')}`;
+        return ok({ set: true, id: entry.id, dueAt, note: `已设置提醒：${whenStr} 到点我会在本群说「${text}」。` });
+      }
+    },
+    {
+      name: 'list_reminders',
+      category: 'system',
+      icon: '📋',
+      description: '查看当前会话里还没触发的所有提醒（闹钟）。适用：群友问"我设了什么提醒"、"还有哪些闹钟"。',
+      parameters: { type: 'object', properties: {} },
+      async execute(ctx) {
+        if (!ctx.reminders) return err('提醒服务未启用');
+        const list = ctx.reminders.pending(ctx.chatKey);
+        if (!list.length) return ok({ count: 0, note: '当前没有待触发的提醒。' });
+        const lines = list.map((r) => {
+          const d = new Date(r.dueAt);
+          const whenStr = `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+          return `- [${r.id}] ${whenStr}：${r.text}`;
+        });
+        return ok({ count: list.length, reminders: lines.join('\n') });
+      }
+    },
+    {
+      name: 'cancel_reminder',
+      category: 'system',
+      icon: '🗑️',
+      description: '取消一个还没触发的提醒（闹钟）。id 从 list_reminders 获取。适用：群友说"取消那个提醒"、"别提醒我了"。',
+      parameters: {
+        type: 'object',
+        properties: { id: { type: 'string', description: '要取消的提醒 id（list_reminders 里 [r_xxx] 那个）' } },
+        required: ['id']
+      },
+      async execute(ctx, args) {
+        if (!ctx.reminders) return err('提醒服务未启用');
+        const id = String(args.id ?? '').trim();
+        if (!id) return err('请提供提醒 id');
+        const done = ctx.reminders.cancel(id);
+        return done ? ok({ cancelled: true, id }) : err(`没找到提醒 ${id}（可能已触发或 id 不对，用 list_reminders 查一下）`);
+      }
+    },
+    // ── 节假日问候 ──
+    {
+      name: 'check_holiday',
+      category: 'system',
+      icon: '🎉',
+      description: '查询今天或最近有什么节日（春节/中秋/端午/元旦/国庆等中国法定与常见节日）。用于在节日时主动向群友送上问候。',
+      parameters: {
+        type: 'object',
+        properties: {
+          days: { type: 'number', description: '往后查几天内的最近节日（默认 7 天；0 表示只查今天）' }
+        }
+      },
+      async execute(ctx, args) {
+        const today = holidayOn(new Date());
+        const days = args.days != null ? Math.max(0, Number(args.days) || 0) : 7;
+        const upcoming = upcomingHoliday(days);
+        const out = {
+          today: today ? { name: today.name, greeting: today.greeting, type: today.type } : null,
+          upcoming: upcoming ? { name: upcoming.name, date: upcoming.date, daysAway: upcoming.daysAway, greeting: upcoming.greeting } : null
+        };
+        let note;
+        if (today) {
+          note = `今天是${today.name}！可以自然地送上祝福（参考：${today.greeting}）。`;
+        } else if (upcoming) {
+          note = upcoming.daysAway === 0
+            ? `今天是${upcoming.name}。`
+            : `今天不是节日。最近的是 ${upcoming.daysAway} 天后的${upcoming.name}（${upcoming.date}）。`;
+        } else {
+          note = `今天不是节日，未来 ${days} 天内也没有常见节日。`;
+        }
+        return ok({ ...out, note });
+      }
+    },
+    // ── 发网图 / 搜网图 ──
+    {
+      name: 'send_image',
+      category: 'media',
+      icon: '🖼️',
+      defaultEnabled: true,
+      description: '把一张网上找到的图片发到当前聊天。默认需要先预览确认（send_image(url, preview=true) 看一眼，再 send_image(url) 发出）。只支持 png/jpg/gif/webp 直链；网页地址不是图片。',
+      parameters: {
+        type: 'object',
+        properties: {
+          url: { type: 'string', description: '图片直链（要整条照抄，不要改动路径字符）' },
+          preview: { type: 'boolean', description: 'true = 先只给自己看一眼、不发送' },
+          note: { type: 'string', description: '可选：配一句话一起发' },
+          replyToMessageId: { type: ['integer', 'string'], description: '可选：引用某条消息的 id' },
+          atUserId: { type: ['integer', 'string'], description: '可选：@ 某人（填 QQ 号）' }
+        },
+        required: ['url']
+      },
+      async execute(ctx, args) {
+        try {
+          const cfg = getConfig();
+          const opt = cfg.security?.imageSend || {};
+          if (opt.enabled !== true) {
+            return err('发网图功能未开启。想让机器人能发网图，请在设置页「聊天设置 → 发网图」里打开。');
+          }
+          const url = String(args.url ?? '').trim();
+          if (!url) return err('url 不能为空');
+          if (!/^https?:\/\//i.test(url)) {
+            return err('只支持 http(s) 图片直链。本地文件路径不能发（那会暴露宿主文件系统）。');
+          }
+          // 每次运行的状态挂在 ctx 上（ctx 每次运行新建，天然隔离、不用持久化）
+          ctx.sendImageState = ctx.sendImageState || { previewed: [], previews: 0, sent: 0 };
+          const st = ctx.sendImageState;
+
+          const isPreview = args.preview === true;
+          const lock = cfg.security?.browseLock || {};
+          // 浏览锁定站点内的图可跳过预览：站内图源可信，省一轮
+          const lockCheck = checkBrowseLock(url, browseLockState());
+          const trusted = lockCheck.enabled && lockCheck.allowed && opt.skipPreviewForLockedHosts !== false;
+
+          if (!isPreview) {
+            if (opt.requirePreview !== false && !trusted && !st.previewed.includes(url)) {
+              return err('发图前要先看一眼：先调 send_image(url, preview=true) 确认这张图合适，再调 send_image(url) 发送。');
+            }
+            if (st.sent >= Math.max(1, Number(opt.maxPerRun) || 3)) {
+              return err(`本次运行已经发了 ${st.sent} 张图，达到上限（设置里可调）。`);
+            }
+          } else if (st.previews >= Math.max(1, Number(opt.maxPreviewsPerRun) || 5)) {
+            return err(`本次运行预览次数已达上限（${st.previews} 次）。挑最有把握的一张直接发。`);
+          }
+
+          // 下载：safe-fetch 全套防护（DNS 固定、逐跳校验、限量、浏览锁定）
+          const maxBytes = Math.max(1, Number(opt.maxBytesMB) || 5) * 1024 * 1024;
+          let buffer;
+          let contentType;
+          try {
+            ({ buffer, contentType } = await safeFetchBinary(url, maxBytes, { browseLocked: !!lock.enabled }));
+          } catch (error) {
+            const msg = String(error?.message ?? error);
+            const hint = /HTTP 404/.test(msg)
+              ? '（地址可能抄错了：请从 web_fetch / search_images 返回的 images 里原样复制，不要改动路径字符；也可能是图已删除）'
+              : '';
+            return err(`图片下载失败：${msg}${hint}`);
+          }
+          if (!buffer || !buffer.length) return err('图片内容为空');
+
+          // 魔数校验：只认真图。很多"图片链接"其实返回 HTML（防盗链页/错误页）
+          const mime = detectMime(buffer);
+          if (!mime) {
+            const head = buffer.subarray(0, 200).toString('utf8').trim().toLowerCase();
+            if (head.startsWith('<!doctype html') || head.startsWith('<html')) {
+              return err('这个地址返回的是网页（HTML），不是图片直链。先用 web_fetch 抓那页，再从它返回的 images 里挑一条直链。');
+            }
+            return err(`这个地址返回的不是图片（Content-Type: ${contentType || '未知'}）。只支持 png/jpg/gif/webp 直链。`);
+          }
+
+          const b64 = buffer.toString('base64');
+          if (isPreview) {
+            st.previews += 1;
+            if (!st.previewed.includes(url)) st.previewed.push(url);
+            // 问图片格式兼容 Skill：这种格式能不能喂给当前模型（webp/avif 在部分接口会直接 400）
+            let supported = true;
+            try {
+              for (const p of skillManager.getCapabilityProviders('image.mime-support', {})) {
+                const r = p.fn({ mime });
+                if (r && r.supported === false) supported = false;
+                break;
+              }
+            } catch { /* 能力坏了不影响预览 */ }
+
+            if (!supported) {
+              return ok(`这张图是 ${mime}（约 ${Math.round(buffer.length / 1024)}KB）。当前视觉接口不支持 ${mime}，看不到画面内容，但字节已校验过是真图、QQ 里能正常显示。你觉得合适就直接调 send_image(url) 发出去（URL 照抄：${url}）。`);
+            }
+            return { content: imageParts(`这张图（${mime}，约 ${Math.round(buffer.length / 1024)}KB）——觉得合适就立刻调 send_image(url) 发出去：`, [`data:${mime};base64,${b64}`]) };
+          }
+
+          // 传 url 而不是只传 base64：OneBot 的 image 段原生支持 http 直链，让**协议端
+          // 自己去下载**，body 从 MB 级降到几十字节。保留 dataUrl 作回退（防盗链/协议端异机）。
+          const result = await ctx.sender.sendImage(ctx.chatKey, { url, dataUrl: `base64://${b64}` }, {
+            note: args.note,
+            replyToMessageId: args.replyToMessageId ?? null,
+            atUserId: args.atUserId ?? null
+          });
+          st.sent += 1;
+          ctx.session.sent.push({
+            type: 'image',
+            text: `[图片${args.note ? `:${String(args.note).slice(0, 40)}` : ''}]`,
+            at: new Date().toLocaleTimeString('zh-CN', { hour12: false })
+          });
+          ctx.emit('session-update', ctx.session.id);
+          return ok({ sent: true, messageId: result?.message_id ?? null, note: '图片已发送。' });
+        } catch (error) {
+          return err(error?.message ?? error);
+        }
+      }
+    },
+    {
+      name: 'search_images',
+      category: 'web',
+      icon: '🔎',
+      requiresSearch: true,
+      description: '搜网图，直接拿到"能发的图片直链"。用法：先 search_images("关键词") 看列表，再挑一条用 send_image(url) 发出去。被要求"发张图/来点表情/找张照片"时用它。',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: '搜索关键词（越具体越准）' },
+          limit: { type: 'integer', description: '最多返回几条，默认 8' }
+        },
+        required: ['query']
+      },
+      async execute(ctx, args) {
+        try {
+          const cfg = getConfig();
+          if (cfg.security?.imageSend?.enabled !== true) {
+            return err('搜图功能未开启。请在设置页「聊天设置 → 发网图」里打开。');
+          }
+          const query = String(args.query ?? '').trim();
+          if (!query) return err('query 不能为空');
+          const limit = Math.min(12, Math.max(1, Number(args.limit) || 8));
+
+          // 动态取图搜能力：特性检测，避免 web-search 缺这个函数时整个注册就崩
+          let searchImagesFn = null;
+          try {
+            const mod = await import('./web-search.js');
+            searchImagesFn = typeof mod.searchImages === 'function' ? mod.searchImages : null;
+          } catch { /* 下面统一报错 */ }
+          if (!searchImagesFn) {
+            return err('图搜能力不可用（web-search 里没有 searchImages）。请用 web_search 找图片页面，再用 web_fetch 拿 images。');
+          }
+
+          const list = await searchImagesFn(query, { limit, browseLocked: browseLockState().enabled });
+          if (!Array.isArray(list) || !list.length) {
+            return ok({ query, results: [], note: '没搜到图。换个更具体的关键词再试一次（最多搜 3 次）。' });
+          }
+          return ok({
+            query,
+            results: list.slice(0, limit).map((r) => ({ title: String(r?.title ?? '').slice(0, 60), url: String(r?.url ?? '') })),
+            note: '挑一条用 send_image(url) 发出去；url 要整条照抄，不要改。都不贴切就换个更具体的词再搜一次（最多搜 3 次）。'
+          });
+        } catch (error) {
+          return err(error?.message ?? error);
+        }
+      }
+    },
+    // ── 视频读取 ──
+    {
+      name: 'read_video',
+      category: 'query',
+      icon: '🎬',
+      description: '读取消息里的视频。会返回时长/分辨率等元信息，并根据设置页的「视频模式」把画面交给模型：原生视频输入（全模态模型）或抽帧截图（普通视觉模型）。适用：群友发了一个视频，你想"看看"里面是什么。需要消息 id（聊天记录里的 #数字）。',
+      parameters: {
+        type: 'object',
+        properties: {
+          messageId: { type: ['integer', 'string'], description: '那条带视频的消息的 QQ 消息 id（聊天记录里的 #数字）' },
+          frames: { type: ['integer', 'string'], description: '可选：本次要抽几帧（1~12）。不传用设置页的默认值。' }
+        },
+        required: ['messageId']
+      },
+      async execute(ctx, args) {
+        try {
+          const entry = ctx.store.findByMid(ctx.chatKey, args.messageId);
+          if (!entry) return err(`在当前会话找不到消息 ${args.messageId}。${midHint(ctx)}`);
+          const videoMedia = (entry.media || []).find((m) => m.kind === 'video');
+          if (!videoMedia) return err('该消息没有视频（媒体里没有 video 段）');
+          if (!ctx.videoReader) return err('视频读取服务未启用');
+          const info = await ctx.videoReader.probe(videoMedia, { count: Number(args.frames) || 0 });
+
+          // 元信息（不含画面）单独作为文本返回。
+          // ⚠️ 必须把画面字段剥掉再序列化：把 base64 图当**文本**送进上下文，
+          //    模型既看不到图，又要为几十万 token 付钱。画面一律走下面的 parts。
+          const metaOut = {
+            messageId: entry.mid,
+            durationSec: info.durationSec,
+            width: info.width,
+            height: info.height,
+            sizeBytes: info.sizeBytes,
+            format: info.format,
+            route: info.route,
+            routeReason: info.routeReason,
+            frameCount: Array.isArray(info.frames) ? info.frames.length : 0,
+            frameTimes: info.frameTimes,
+            note: info.note || '已读取视频信息。'
+          };
+          const metaText = JSON.stringify(metaOut, null, 1);
+
+          // 原生视频输入：把视频地址作为 video 部分交给模型（由 llm.js 换成 videoModel）
+          if (info.route === 'native' && info.nativeUrl) {
+            return {
+              content: [
+                { type: 'text', text: `${metaText}\n\n（画面已作为视频输入发送）` },
+                { type: 'video_url', video_url: { url: info.nativeUrl } }
+              ]
+            };
+          }
+
+          // 抽帧：每一帧作为一个 image 部分交给模型
+          if (info.route === 'frames' && Array.isArray(info.frames) && info.frames.length) {
+            return {
+              content: [
+                { type: 'text', text: `${metaText}\n\n（以下 ${info.frames.length} 张是抽帧截图，不是连续视频）` },
+                ...info.frames.map((url) => ({ type: 'image_url', image_url: { url } }))
+              ]
+            };
+          }
+
+          // 只给元信息（off / 抽帧不可用 / 全模态模型没配）
+          return ok(metaOut);
+        } catch (error) {
+          return err(error?.message ?? error);
+        }
+      }
     }
-  ];
+];
+
+// 内置工具一次性注册进工具注册表：id = name（A 版历史上用 name 当函数名，
+// 这样旧调用方按 name 查找、orchestrator 按 name 过滤都仍然成立）。
+// 注册之后，技能/插件注册进来的工具会自动出现在 listTools() 里。
+let builtinsReady = false;
+
+// 运行期依赖标记：让 getToolAvailability 的统一口径也能正确判定内置工具
+// （A 的 orchestrator 里另有一份硬编码过滤，两边口径保持一致）。
+const VISION_TOOL_NAMES = new Set(['get_message_images', 'get_sticker_image']);
+const SEARCH_TOOL_NAMES = new Set(['web_search', 'web_fetch', 'search_images']);
+
+function ensureBuiltinsRegistered() {
+  if (builtinsReady) return;
+  builtinsReady = true;
+  // 随「功能移植」加入的工具（图搜 / 梗库 / 跨群记忆读写 / 情绪 / 情爱 / 风格 / 棋局）。
+  // 先注册它：内部只调 registerTool、不依赖本文件的任何局部函数，顺序无关。
+  registerPortedTools();
+  for (const d of BUILTIN_TOOL_DEFS) {
+    registerTool({
+      ...d,
+      id: d.name,
+      name: d.name,
+      requiresVision: d.requiresVision ?? VISION_TOOL_NAMES.has(d.name),
+      requiresSearch: d.requiresSearch ?? SEARCH_TOOL_NAMES.has(d.name)
+    });
+  }
+}
+
+/** 全部工具定义（内置 + 由 Skill/插件注册的）。 */
+export function buildToolDefs() {
+  ensureBuiltinsRegistered();
+  return listTools();
 }
 
 /** 转成 OpenAI tools 参数格式。 */
@@ -626,7 +1128,8 @@ export function toOpenAiTools(defs) {
   return defs.map((d) => ({
     type: 'function',
     function: {
-      name: d.name,
+      // 技能工具的 id 带 `skillId__` 前缀（OpenAI 函数名规范），优先用它
+      name: d.id ?? d.name,
       description: d.description,
       parameters: d.parameters
     }
@@ -635,7 +1138,7 @@ export function toOpenAiTools(defs) {
 
 /** 找到并执行一个工具调用。返回 { content, isError }，content 为 string 或 parts 数组。 */
 export async function executeTool(defs, ctx, name, argsJson) {
-  const def = defs.find((d) => d.name === name);
+  const def = defs.find((d) => (d.id ?? d.name) === name);
   if (!def) return { content: `错误：未知工具 ${name}`, isError: true };
   let args = {};
   const raw = argsJson ?? '{}';

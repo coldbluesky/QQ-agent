@@ -1,0 +1,48 @@
+{
+  "id": "memory-recall",
+  "name": "回忆（主动检索）",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "category": "knowledge",
+  "description": "让机器人能主动翻旧账：搜索很久以前聊过的话题、按天调阅聊天归档、查看记忆索引状态。",
+  "author": "QQ Agent",
+  "enabledByDefault": true,
+  "capabilities": [],
+  "requires": [
+    "memory.search",
+    "memory.archive",
+    "memory.status"
+  ],
+  "settings": {
+    "defaultLimit": 5,
+    "maxLimit": 12,
+    "maxSnippetChars": 300
+  },
+  "configSchema": {
+    "defaultLimit": {
+      "type": "number",
+      "label": "默认检索条数",
+      "description": "模型没指定条数时返回几条记忆片段（1~12，默认 5）。条数越多越贵，一般不用改。"
+    },
+    "maxLimit": {
+      "type": "number",
+      "label": "单次检索上限",
+      "description": "模型最多能一次要几条（默认 12）。防止它一次性把整个记忆库拖进上下文。"
+    },
+    "maxSnippetChars": {
+      "type": "number",
+      "label": "单条片段最长字数",
+      "description": "每条命中记忆截断到多少字（默认 300）。太长会挤占对话本身的上下文预算。"
+    }
+  },
+  "prompt": {
+    "sections": [
+      {
+        "id": "memory-recall-usage",
+        "title": "回忆（主动检索）",
+        "priority": 55,
+        "content": "当有人提到「很久以前」「上次说的那个」这类很久之前的事，而你的上下文里没有时，用 memory_search 主动检索，不要直接说「不记得了」。想按时间翻某天的聊天记录用 memory_archive。检索不到就如实说没找到，绝对不要凭印象编造细节——编错了比说不知道严重得多。"
+      }
+    ]
+  }
+}

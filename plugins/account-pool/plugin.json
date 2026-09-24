@@ -1,0 +1,55 @@
+{
+  "id": "account-pool",
+  "name": "账号池负载均衡",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "category": "model",
+  "description": "配多个 API 端点/Key，按实测延迟自动分配请求；快的多干活，被限流的临时冷却。",
+  "author": "QQ Agent",
+  "enabledByDefault": false,
+  "capabilities": [
+    "llm.endpoint-pick",
+    "llm.endpoint-feedback"
+  ],
+  "requires": [],
+  "settings": {
+    "accounts": [],
+    "strategy": "weighted",
+    "weightDecay": 0.05,
+    "minWeight": 0.1,
+    "cooldownMs": 60000
+  },
+  "configSchema": {
+    "strategy": {
+      "type": "enum",
+      "label": "分配策略",
+      "values": [
+        "weighted",
+        "round-robin",
+        "fixed"
+      ],
+      "description": "weighted = 按实测延迟加权随机（推荐）；round-robin = 轮流；fixed = 只用第一个。"
+    },
+    "weightDecay": {
+      "type": "number",
+      "label": "延迟平滑系数",
+      "description": "0.05 表示新样本占 5% 权重。越大越跟手，越小越稳定。"
+    },
+    "minWeight": {
+      "type": "number",
+      "label": "最低权重",
+      "description": "防止某个账号被彻底饿死。默认 0.1。"
+    },
+    "cooldownMs": {
+      "type": "number",
+      "label": "限流冷却时长（毫秒）",
+      "description": "被 429 后该账号多久不接活。默认 60000（1 分钟）。"
+    },
+    "accounts": {
+      "type": "internal",
+      "label": "账号列表",
+      "description": "由账号池的专用界面管理（是一组带 Key/权重的对象，通用的键值表单渲染不了）。"
+    }
+  },
+  "prompt": null
+}

@@ -1,0 +1,39 @@
+{
+  "id": "text-tools",
+  "name": "文本工具",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "category": "utility",
+  "description": "文本处理的几件小事：字数统计、大小写与全半角转换、去重复行、取片段、简单编码。",
+  "author": "QQ Agent",
+  "enabledByDefault": true,
+  "capabilities": [],
+  "requires": [],
+  "settings": {
+    "maxInputChars": 20000,
+    "hashAlgo": "sha256"
+  },
+  "configSchema": {
+    "maxInputChars": {
+      "type": "number",
+      "label": "单次处理字数上限",
+      "description": "超过这个长度的文本直接拒绝（默认 20000）。防止模型把整段聊天记录塞进来做正则运算把进程拖住。"
+    },
+    "hashAlgo": {
+      "type": "enum",
+      "label": "摘要算法",
+      "values": ["sha256", "sha1", "md5"],
+      "description": "计算文本摘要（指纹）时用的算法。默认 sha256；md5/sha1 只为与旧数据比对，不建议用于安全场景。"
+    }
+  },
+  "prompt": {
+    "sections": [
+      {
+        "id": "text-tools-usage",
+        "title": "文本工具",
+        "priority": 35,
+        "content": "需要精确统计字数、转换大小写/全半角、去重行、截取片段或算文本指纹时，调用文本工具，不要凭感觉估。尤其是「帮我数一下多少字」——估出来的数字基本都不对。"
+      }
+    ]
+  }
+}

@@ -1,4 +1,6 @@
 // 通用小工具：无业务逻辑。
+import fs from 'node:fs';
+import * as nodePath from 'node:path';
 
 export function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
@@ -177,4 +179,133 @@ export function createEventBus() {
 export function truncate(text, max = 400) {
   const s = String(text ?? '');
   return s.length <= max ? s : `${s.slice(0, max)}…(共${s.length}字)`;
+}
+
+// ── 发消息前的文本清洗 ────────────────────────────────────────────────────
+//
+// 这三个是"直接减少群里出现乱码"的小补丁 —— 模型偶尔会：
+//   · 在开头多写一段"回复 @某某："（那不是要说的话）
+//   · 把内容写成 `["在的"]` 整串发出去（方括号和引号都进了群）
+//   · 或者混进一堆 emoji（某些场景要纯文字）
+// 放在发送前统一清洗，比在提示词里反复叮嘱可靠。
+
+/**
+ * 去掉开头的"回复 @某某："前缀。
+ *
+ * 模型引用某人说话时，有时会把"回复 @张三："当成正文的一部分写进来，
+ * 而真正的引用已经由 replyToMessageId 表达过了 —— 于是群里出现重复的"回复 @"。
+ * 只在**开头**匹配，且必须是"回复/@ 目标：内容"这种明确形态，
+ * 不会误伤正文里正常出现的 @（那是真的想 @ 人）。
+ */
+export function stripLeadingReplyPrefix(text) {
+  const s = String(text ?? '');
+  // 形态：可选"回复"，@某名字（不含空格/冒号），可选"："或"，"，然后是正文
+  return s.replace(/^\s*(?:回复|reply)?\s*@[^\s:：,，]{1,24}\s*[:：,，]\s*/i, '').trim();
+}
+
+/**
+ * 收拾方括号噪音。
+ *
+ * 现象（实测）：模型想发一条"在的"，却输出成 `["在的"]`，
+ * 于是群里收到的字面就是 `["在的"]` —— 用户看到一串符号。
+ * 做法：如果**整串**就是一个"方括号包着的单个字符串"，剥掉外壳；
+ * 不做更激进的清理（比如删掉句中所有方括号），那会误伤正常内容。
+ */
+export function tidyBrackets(text) {
+  const s = String(text ?? '');
+  const m = /^\s*\[\s*(["'“”])([\s\S]*?)\1\s*\]\s*$/.exec(s);
+  if (m) return m[2].trim();
+  return s;
+}
+
+/**
+ * 去 emoji（含常见符号与变体选择符）。
+ *
+ * 用途：需要"纯文字"判定的场景（如关键词匹配、日志展示）。
+ * **不要在正常发送路径上用它** —— 那会把用户/模型有意发的表情全删掉。
+ */
+export function stripEmoji(text) {
+  return String(text ?? '')
+    // 表情符号区 + 杂项符号 + 装饰符号 + 变体选择符 + 零宽连接符
+    .replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}\u{200D}]/gu, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// ── 原子写盘（被十余个数据模块共用）─────────────────────────────────────
+// 为什么单独抽出来：emotion / intimacy / chess / meme-store / style-learn /
+// temp-settings / memory-global 都要往 data/ 下写状态文件。直接 writeFileSync
+// 会在写一半时被读到半个文件（进程崩溃、断电、两个实例同时读写）。
+// 统一走"写临时文件 + rename 覆盖"，rename 在同一文件系统内是原子的。
+
+/**
+ * 把文件系统写错误翻译成"用户能照着做"的提示（其它错误原样返回）。
+ *
+ * 起因：Windows 上目标文件被 ACL 改成"当前用户只读"、或被别的进程占着时，
+ * `renameSync(tmp, file)` 会报 `EPERM: operation not permitted`。
+ * 这句原文丢给用户等于没说 —— 他不知道是权限问题，也不知道怎么办。
+ */
+export function describeFsWriteError(error, file = '') {
+  const code = String(error?.code || '');
+  if (!['EPERM', 'EACCES', 'EBUSY', 'EROFS', 'EISDIR'].includes(code)) return error;
+  const name = file ? nodePath.basename(String(file)) : '数据文件';
+  const wrapped = new Error(
+    `写入 ${name} 失败（${code}）：该文件被系统锁定，或当前用户没有写权限。`
+    + '请用管理员身份运行「修复数据权限」脚本，或把它的所有者改回当前用户后重试。'
+  );
+  wrapped.code = code;
+  wrapped.cause = error;
+  return wrapped;
+}
+
+let tmpSeq = 0;
+
+/**
+ * 原子写文本：先写 `<file>.<pid>.<n>.tmp` 再 rename 覆盖，避免读到半个文件。
+ *
+ * ⚠️ 三个必须做对的细节（都真实踩过）：
+ *   1. **rename 覆盖只读文件会 EPERM**（Windows/Node 实测）：
+ *      `writeFileSync(tmp)` 能成功（tmp 是新文件），但 `renameSync(tmp, 目标)`
+ *      替换一个带只读属性(+R)的目标时被系统拒绝，报
+ *      `EPERM: operation not permitted, rename ...`。
+ *      而失败的后果最讨嫌 —— 内存里改好的内容没落盘，用户看到"删了又回来"。
+ *      所以这里**先试着把只读位清掉再 rename 一次**（自愈）；只有连 chmod
+ *      都做不到（真的是 ACL 只读）才认输。
+ *   2. **rename 失败要把 tmp 删掉**。旧写法失败时直接把 tmp 留在原地，
+ *      于是 data/ 下越攒越多 `xxx.json.12345.tmp` 垃圾（实测堆了十几个）——
+ *      每个都是"某次写盘失败"的证据，但看上去像数据文件损坏。
+ *   3. **失败要抛人话**，见 describeFsWriteError。
+ *
+ * @param {string} file 目标文件绝对路径
+ * @param {string} text 写完的内容
+ */
+export function writeTextAtomic(file, text) {
+  tmpSeq = (tmpSeq + 1) % 1e6;
+  const tmp = `${file}.${process.pid}.${tmpSeq}.tmp`;
+  try {
+    fs.mkdirSync(nodePath.dirname(file), { recursive: true });
+    fs.writeFileSync(tmp, text, 'utf8');
+    try {
+      fs.renameSync(tmp, file);
+    } catch (error) {
+      if (error?.code !== 'EPERM' && error?.code !== 'EACCES') throw error;
+      // 目标带只读属性时 rename 被拒：清掉只读位再试一次（文件所有权还在，通常能成功）
+      let healed = false;
+      try {
+        const mode = fs.statSync(file).mode;
+        fs.chmodSync(file, mode | 0o200);
+        healed = true;
+      } catch { /* 连 stat/chmod 都不行，说明是真的没权限，往下抛人话 */ }
+      if (healed) fs.renameSync(tmp, file);
+      else throw error;
+    }
+  } catch (error) {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* ignore */ }
+    throw describeFsWriteError(error, file);
+  }
+}
+
+/** 原子写 JSON（写盘格式统一走这里，便于以后换序列化方式）。 */
+export function writeJsonAtomic(file, value, indent = 1) {
+  writeTextAtomic(file, JSON.stringify(value, null, indent));
 }

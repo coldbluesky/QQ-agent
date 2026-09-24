@@ -1,0 +1,31 @@
+{
+  "id": "ban-state",
+  "name": "群禁言状态",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "category": "utility",
+  "description": "记住机器人在哪些群被禁言。被禁言时发不出话，因此不再白跑一轮烧 token。",
+  "author": "QQ Agent",
+  "enabledByDefault": true,
+  "capabilities": [
+    "chat.ban-state"
+  ],
+  "requires": [],
+  "settings": {
+    "skipRunWhenMuted": true,
+    "markReadWhenMuted": true
+  },
+  "configSchema": {
+    "skipRunWhenMuted": {
+      "type": "boolean",
+      "label": "被禁言时不发起运行",
+      "description": "开启后，处于禁言状态的群直接跳过处理。禁言期间发的消息一条也发不出去，跑了纯属烧 token。"
+    },
+    "markReadWhenMuted": {
+      "type": "boolean",
+      "label": "跳过时把积压消息标为已读",
+      "description": "关闭的话积压消息会在解禁后被一次性处理（可能是一大段过期对话）；开启则丢掉不处理。"
+    }
+  },
+  "prompt": null
+}

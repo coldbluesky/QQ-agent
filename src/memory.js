@@ -370,6 +370,28 @@ export class MemoryStore {
     return true;
   }
 
+  /**
+   * 删除一个会话的**全部**记忆（记忆页「删除本会话记忆」按钮）。
+   * 成员文件、_meta.json、旧版单文件与备份一并清掉；目录本身保留
+   * （可能是挂载点/被占用，删不掉也无妨——里面已空）。
+   * @returns {boolean} 是否删掉了东西
+   */
+  removeChat(chatKey) {
+    const dir = chatDir(chatKey);
+    let removed = false;
+    try {
+      for (const f of fs.readdirSync(dir)) {
+        fs.rmSync(path.join(dir, f), { recursive: true, force: true });
+        removed = true;
+      }
+    } catch { /* 目录不存在 = 没有记忆可删 */ }
+    // 旧版单文件（迁移前的形态）
+    try { fs.rmSync(legacyFile(chatKey), { force: true }); removed = true; } catch { /* ignore */ }
+    // 内存缓存同步清掉，否则同进程内 members() 还能读到旧数据
+    this.#ensureChat(chatKey).clear();
+    return removed;
+  }
+
   remove(chatKey, category, { userId = '', target = '', content = '' } = {}) {
     if (category !== 'memberImpression') return false;
     const map = this.#ensureChat(chatKey);

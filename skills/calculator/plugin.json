@@ -1,0 +1,38 @@
+{
+  "id": "calculator",
+  "name": "计算器",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "category": "utility",
+  "description": "让模型把算数交给程序做：四则运算、百分比、幂与取模，避免大数心算出错。",
+  "author": "QQ Agent",
+  "enabledByDefault": true,
+  "capabilities": [],
+  "requires": [],
+  "settings": {
+    "precision": 8,
+    "allowPower": true
+  },
+  "configSchema": {
+    "precision": {
+      "type": "number",
+      "label": "结果小数位",
+      "description": "保留几位小数（0~15）。浮点误差（如 0.1+0.2）就是靠这里收干净的，默认 8 位。"
+    },
+    "allowPower": {
+      "type": "boolean",
+      "label": "允许幂运算",
+      "description": "开启后支持 2^10 这类写法与 pow 函数；关掉可避免模型算出 10^999999 这种把进程拖死的表达式。"
+    }
+  },
+  "prompt": {
+    "sections": [
+      {
+        "id": "calculator-usage",
+        "title": "计算器",
+        "priority": 40,
+        "content": "需要算数时优先调用计算器工具，不要自己心算。尤其是多位数乘除、百分比、连续运算——心算错了用户会当成你在胡说。工具支持 + - * / % ^ 与括号，也认 sqrt/abs/round/floor/ceil/min/max。"
+      }
+    ]
+  }
+}

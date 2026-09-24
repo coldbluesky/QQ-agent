@@ -78,7 +78,7 @@ export class ChatStore {
   }
 
   /** 追加一条收到的消息（未读）。返回写入的条目。 */
-  appendIncoming(chatKey, { mid, ts, senderId, senderName, text, reply = null, media = [] }) {
+  appendIncoming(chatKey, { mid, ts, senderId, senderName, text, reply = null, media = [], isPoke = false }) {
     const st = this.#state(chatKey);
     const entry = {
       id: st.nextLocalId++,
@@ -90,7 +90,9 @@ export class ChatStore {
       self: false,
       read: false,
       reply: reply || null,
-      media: Array.isArray(media) ? media : []
+      media: Array.isArray(media) ? media : [],
+      // 拍一拍事件：可作触发批（resolveContextTier 按 1 档响应），但不进【过去状态】
+      isPoke: Boolean(isPoke)
     };
     st.messages.push(entry);
     this.#trim(st);
@@ -148,6 +150,27 @@ export class ChatStore {
     return n;
   }
 
+  /**
+   * 把时间窗内的**已读**消息重新标记为未读（手动重试失败会话用）。
+   *
+   * 触发批当初被 drainUnread 置了已读；重试时按会话起止时间把它们翻回未读，
+   * 唤醒流程就能重新取走它们。窗口向前放宽 5 分钟（容纳防抖聚批期），
+   * 向后到会话结束 —— 窗口外的不动，避免误翻后来真正已读的历史。
+   * @returns {number} 恢复为未读的条数
+   */
+  markUnreadInWindow(chatKey, startedAt, endedAt) {
+    const st = this.#state(chatKey);
+    const winStart = Number(startedAt) - 5 * 60 * 1000;
+    const winEnd = Number(endedAt || startedAt) + 1000;
+    let n = 0;
+    for (const m of st.messages) {
+      if (m.self) continue;
+      if (m.read && m.ts >= winStart && m.ts <= winEnd) { m.read = false; n++; }
+    }
+    if (n) saveChat(st);
+    return n;
+  }
+
   unreadCount(chatKey) {
     const st = this.#state(chatKey);
     return st.messages.filter((m) => !m.read && !m.self).length;
@@ -171,6 +194,22 @@ export class ChatStore {
     const st = this.#state(chatKey);
     const target = String(mid);
     return st.messages.find((m) => String(m.mid) === target) || null;
+  }
+
+  /**
+   * 标记一条消息已被用户撤回（按 QQ 消息 id）。
+   * 撤回的消息后续不再发给大模型（buildPastState 会过滤 recalled）。
+   * @returns {boolean} 是否找到并标记了
+   */
+  markRecalled(chatKey, mid) {
+    const st = this.#state(chatKey);
+    const target = String(mid);
+    const m = st.messages.find((x) => String(x.mid) === target);
+    if (!m) return false;
+    m.recalled = true;
+    m.read = true;   // 撤回的消息也算"已读"，不再触发回复
+    saveChat(st);
+    return true;
   }
 
   /**
@@ -198,6 +237,45 @@ export class ChatStore {
   findByLocalId(chatKey, localId) {
     const st = this.#state(chatKey);
     return st.messages.find((m) => m.id === Number(localId)) || null;
+  }
+
+  /**
+   * 删除指定本地 id 的消息（部分清除）。返回删掉的条数。
+   * @param {string} chatKey
+   * @param {number[]} localIds 本地递增 id 数组
+   */
+  removeByLocalIds(chatKey, localIds = []) {
+    const st = this.#state(chatKey);
+    const ids = new Set((Array.isArray(localIds) ? localIds : [localIds]).map(Number));
+    if (!ids.size) return 0;
+    const before = st.messages.length;
+    st.messages = st.messages.filter((m) => !ids.has(m.id));
+    const removed = before - st.messages.length;
+    if (removed) saveChat(st);
+    return removed;
+  }
+
+  /**
+   * 清空某会话的全部消息（整体清除）。返回删掉的条数。
+   * 会话文件保留（空 messages），下次来消息继续往里写。
+   */
+  clearChat(chatKey) {
+    const st = this.#state(chatKey);
+    const removed = st.messages.length;
+    if (removed) {
+      st.messages = [];
+      saveChat(st);
+    }
+    return removed;
+  }
+
+  /**
+   * 仅屏蔽（不删除）：把某会话的全部未读标记为已读。
+   * 与 markAllRead 相同语义，这里显式命名供"仅屏蔽、不再发送"场景调用。
+   * 返回标记的条数。
+   */
+  muteUnread(chatKey) {
+    return this.markAllRead(chatKey);
   }
 
   /** 最近 senderId 出现过的活跃成员（带最后发言时间）。 */

@@ -1,0 +1,52 @@
+{
+  "id": "speech-to-text",
+  "name": "语音转文字",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "category": "media",
+  "description": "用本地 whisper.cpp 把群友发的语音转成文字，让模型能读懂语音内容。",
+  "author": "QQ Agent",
+  "enabledByDefault": false,
+  "capabilities": [
+    "media.transcribe"
+  ],
+  "requires": [],
+  "settings": {
+    "whisperPath": "",
+    "modelPath": "",
+    "language": "zh",
+    "timeoutMs": 30000
+  },
+  "configSchema": {
+    "whisperPath": {
+      "type": "string",
+      "label": "whisper-cli 路径",
+      "description": "留空则在 PATH 里自动探测 whisper-cli / whisper。"
+    },
+    "modelPath": {
+      "type": "string",
+      "label": "模型文件路径（必填）",
+      "description": "whisper.cpp 的 ggml 模型文件，如 ggml-base.bin。不填则本 Skill 不可用。"
+    },
+    "language": {
+      "type": "string",
+      "label": "识别语言",
+      "description": "默认 zh。填 auto 让 whisper 自己判断。"
+    },
+    "timeoutMs": {
+      "type": "number",
+      "label": "单条识别超时（毫秒）",
+      "description": "默认 30000。识别超时会放弃并保持 [语音] 占位。"
+    }
+  },
+  "prompt": {
+    "sections": [
+      {
+        "id": "stt-note",
+        "title": "语音消息",
+        "priority": 35,
+        "content": "群友发的语音会被转成文字给你看。转写可能有错（口音、同音字、背景噪音），拿不准时按上下文理解，不要揪着疑似听错的字眼较真。"
+      }
+    ]
+  }
+}

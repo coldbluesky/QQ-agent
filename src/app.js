@@ -19,6 +19,16 @@ import { listModels, chatCompletion, resolveApiKey, estimateCost, cacheHitRate }
 import { resolveOfficialPrice, listOfficialPrices, isPeakHour, priceAt, resolveModelPrice, modelLabel, splitModelLabel, UNKNOWN_VENDOR } from './model-prices.js';
 import { initPriceFeed, refreshPriceFeed, priceFeedStatus } from './price-feed.js';
 import { startTelemetryLoop } from './telemetry.js';
+import { loadPlugins, watchPlugins } from './plugin-loader.js';
+import { skillManager } from './skills/manager.js';
+import { createSkillRoutes } from './skill-routes.js';
+import { createPortedRoutes } from './ported-routes.js';
+import { afterSend as portedAfterSend } from './agent-hooks.js';
+import { attachPortedMemory } from './memory-ported.js';
+import { extractCandidateUrls, dispatchMediaLinks } from './media-links.js';
+import { acquireInstanceLock, releaseInstanceLock, registerLockCleanup } from './instance-lock.js';
+import { ReminderStore } from './reminders.js';
+import { VideoReader } from './video-reader.js';
 import { importFromDsh, currentProviders, setProviderKey, testAllProviders, testOneProvider, testModelChat, fetchModelsFrom, upsertProvider, addModelsToProvider, removeModelFromProvider } from './providers.js';
 import { scanModelsVision, visionResults, modelImageVerdict } from './vision-scan.js';
 import { builtinVisionResults } from './model-vision-docs.js';
@@ -74,8 +84,21 @@ function compareSemver(a, b) {
   return 0;
 }
 
+// 退出清理（单实例锁释放）只注册一次：测试里会反复 createApp，重复注册会累积监听器。
+let lockCleanupRegistered = false;
+
 export function createApp({ log = console.log } = {}) {
   const cfg = getConfig();
+  // ── 单实例锁：同一数据目录只允许一个核心进程 ──
+  // 两份核心会双份连协议端、双份处理群消息 → 群里看到重复回复。
+  const lockResult = acquireInstanceLock();
+  if (!lockResult.ok) {
+    throw new Error(`[单实例] ${lockResult.reason}。如需多开，请用不同的 QQ_AGENT_PROFILE（或 QQ_AGENT_DATA_DIR）。`);
+  }
+  if (!lockCleanupRegistered) {
+    lockCleanupRegistered = true;
+    registerLockCleanup();
+  }
   const bus = createEventBus();
   const sseClients = new Set();
 
@@ -275,6 +298,12 @@ export function createApp({ log = console.log } = {}) {
   const visionScan = { running: false };   // 模型图片输入能力扫描的运行状态
   const store = new ChatStore(cfg.store?.maxMessagesPerChat ?? 0);   // 0 = 不限
   const memory = new MemoryStore();
+  // 移植层记忆：把「跨群档案 / 梗知识库 / 说话风格」三个子系统非侵入式挂到 MemoryStore 上
+  // （移植工具通过 ctx.memory.global / .memes / .style 取能力）。挂不上就是该功能不可用。
+  attachPortedMemory(memory, {
+    chat: (messages, opts) => chatCompletion({ messages, ...(opts || {}) }),
+    log
+  });
   const sessions = new SessionRegistry(cfg.store?.keepSessionFiles ?? 0);   // 0 = 不限
   const onebot = new OneBotClient({
     wsUrl: cfg.snowluma?.wsUrl,
@@ -286,11 +315,22 @@ export function createApp({ log = console.log } = {}) {
   const stickers = new StickerManager(onebot);
   const sender = new SendQueue({
     onebot, store,
-    onSent: ({ chatKey, text }) => log(`[发送 -> ${chatKey}] ${String(text).slice(0, 60)}`)
+    log: (msg) => log(msg),
+    onSent: ({ chatKey, text }) => {
+      log(`[发送 -> ${chatKey}] ${String(text).slice(0, 60)}`);
+      // 移植层：把自己说过的话记进姐妹/情绪体系（失败绝不影响发送）
+      try { portedAfterSend({ chatKey, text }); } catch { /* ignore */ }
+    }
   });
+  // 提醒（闹钟）与视频读取：始终注入，工具体内部读配置决定是否可用
+  const reminders = new ReminderStore();
+  const videoReader = new VideoReader(onebot);
   // 语音合成器注入：工具能否拿到 tts 还取决于 voice.enabled（在 orchestrator 里过滤）。
   // 这里始终注入，开关翻转时无需重建 orchestrator。
-  const orchestrator = new Orchestrator({ store, memory, stickers, sender, sessions, onebot, emit, tts: { speak } });
+  const orchestrator = new Orchestrator({
+    store, memory, stickers, sender, sessions, onebot, emit,
+    tts: { speak }, reminders, videoReader
+  });
 
   // 远程价格表：启动即初始化（内部幂等；URL 为空则完全不动）
   initPriceFeed(cfg.api?.priceRemoteUrl || '');
@@ -488,6 +528,11 @@ export function createApp({ log = console.log } = {}) {
     });
     emit('chat-update', `${kind}:${id}`);
     orchestrator.onIncoming(`${kind}:${id}`);
+
+    // 链接媒体转发（确定性触发）：消息里出现 B站/抖音链接就下载并转发。
+    // 与 LLM 型的区别正在这里：插件开着、条件满足就一定跑，模型想忽略也忽略不掉；
+    // 一个提供者都不在（插件未装/未启用）时零网络请求、零副作用。
+    forwardLinkedMedia(kind, id, text).catch((error) => log(`[media] 转发失败：${error?.message ?? error}`));
   }
 
   async function ingestPoke(event) {
@@ -732,6 +777,10 @@ export function createApp({ log = console.log } = {}) {
     if (pathname.startsWith('/api/')) {
       if (!authorize(req)) return json(res, 401, { error: '未授权' });
       const method = req.method;
+      // 技能/插件管理路由（/api/skills*、/api/tools*）：命中则直接返回
+      if (await skillRoutes({ pathname, method, req, res })) return;
+      // 移植层（/api/ported/*）与实例管理（/api/instances*）
+      if (await portedRoutes({ pathname, method, req, res })) return;
       const cfgNow = getConfig();
 
       if (pathname === '/api/status' && method === 'GET') {
@@ -1240,10 +1289,15 @@ export function createApp({ log = console.log } = {}) {
         const patch = await readBody(req);
         const next = updateConfig(patch);
         store.setMaxPerChat(next.store?.maxMessagesPerChat ?? 0);
+        // 会话文件保留上限改了要立即生效（原来是"只在构造时读一次"，要重启才起作用）
+        try { sessions.setKeepFiles?.(next.store?.keepSessionFiles ?? 0); } catch { /* ignore */ }
         if (next.proactive?.enabled) orchestrator.startProactiveLoop(); else orchestrator.stopProactiveLoop();
         initPriceFeed(next.api?.priceRemoteUrl || '');   // 远程价格表 URL 可能改了（内部幂等）
         emit('status', { configUpdated: true });
-        return json(res, 200, { ok: true, config: next });
+        // ⚠️ 必须脱敏：updateConfig 返回的是内存里的活配置对象，含明文 apiKey /
+        //    accessToken / dshProviderKeys。GET /api/config 一直是脱敏的，
+        //    这里漏掉会让"任何一次保存设置"把全部明文密钥回传给浏览器。
+        return json(res, 200, { ok: true, config: sanitizeConfig(next) });
       }
 
       if (pathname === '/api/version' && method === 'GET') {
@@ -1665,6 +1719,53 @@ export function createApp({ log = console.log } = {}) {
   // ── 启停 ──
   // DSH 自动导入已移除：模型目录改为在设置页手动维护（见 /api/providers 相关接口）。
 
+  // ── 链接媒体转发（确定性触发）──
+  /**
+   * 消息里出现 B站/抖音链接 → 下载并转发。
+   * 核心只做调度（候选链接提取、多提供者协商、失败文案都在 src/media-links.js），
+   * 平台解析由 media.download 能力的提供者（插件）负责。
+   */
+  async function forwardLinkedMedia(kind, id, text) {
+    const providers = skillManager.getCapabilityProviders('media.download');
+    if (!providers.length) return;
+    await dispatchMediaLinks({
+      urls: extractCandidateUrls(text),
+      providers,
+      ctx: { onebot, sender, kind, chatId: id, text },
+      log
+    });
+  }
+
+  // ── 技能 / 插件 ──
+  let pluginWatcher = null;
+
+  /**
+   * 加载（或重扫）skills/ 与 plugins/，激活已启用的，并刷新编排器的工具集。
+   * 任何一步失败都不影响主流程 —— 技能系统是增强，不是必需。
+   */
+  async function reloadSkills(reason = 'boot') {
+    const result = await loadPlugins({ log: (...a) => log('[skill]', ...a) });
+    for (const st of skillManager.list()) {
+      if (st.enabled && st.loaded) {
+        try { skillManager.activate(st.id); } catch (error) { log(`[skill] 激活 ${st.id} 失败：${error?.message ?? error}`); }
+      }
+    }
+    const count = orchestrator.refreshToolDefs();
+    if (reason !== 'boot') {
+      log(`[skill] 重扫完成（${reason}）：${result.loaded.length} 成功，${result.failed.length} 失败；当前 ${count} 个工具`);
+    }
+    return { ...result, toolCount: count };
+  }
+
+  // 技能/插件管理路由（自包含模块；json/readBody/sanitizeConfig 都是函数声明，已提升）
+  const skillRoutes = createSkillRoutes({
+    getConfig, updateConfig, emit, json, readBody, sanitizeConfig, reloadSkills
+  });
+  // 移植层 + 实例管理路由（同样自包含）
+  const portedRoutes = createPortedRoutes({
+    getConfig, updateConfig, emit, json, readBody, log, memory, store, reloadSkills
+  });
+
   // ── 启停 ──
   async function listenOn(port) {
     return new Promise((resolve, reject) => {
@@ -1719,7 +1820,25 @@ export function createApp({ log = console.log } = {}) {
       // accessToken/httpToken 已由 applyTokens 直接挂到实例（候选[0]）
     }
     await onebot.connect();
+    // 会话索引缓存的后台对账：启动毫秒级返回（先读缓存），对账在事件循环空闲时做。
+    try { sessions.reconcileInBackground(); } catch { /* 对账失败保持现状 */ }
+    // 技能/插件：加载 → 激活 → 刷新工具集；按配置开热重载
+    try {
+      const r = await reloadSkills('boot');
+      log(`[skill] 工具集已就绪：${r.toolCount} 个工具（技能 ${r.loaded.length} / 失败 ${r.failed.length}）`);
+      const hotReloadOn = process.env.QQ_AGENT_DEV === '1' || getConfig().extensions?.hotReload !== false;
+      if (hotReloadOn) {
+        pluginWatcher = watchPlugins({
+          log: (...a) => log('[skill]', ...a),
+          onReload: () => { reloadSkills('watch').catch((e) => log('[skill] 重扫失败:', e?.message ?? e)); }
+        });
+      }
+    } catch (error) {
+      log(`[skill] 技能系统加载失败（不影响主流程）：${error?.message ?? error}`);
+    }
     if (getConfig().proactive?.enabled) orchestrator.startProactiveLoop();
+    // 提醒（闹钟）调度：到点主动发消息
+    try { orchestrator.startReminderLoop(); } catch (error) { log(`[reminder] 调度启动失败：${error?.message ?? error}`); }
     log(`控制台已就绪：http://127.0.0.1:${port}`);
     log(`OneBot（SnowLuma）: ws=${getConfig().snowluma?.wsUrl} http=${getConfig().snowluma?.httpUrl}`);
     log(`模型: ${getConfig().api.model || '（未设置，请在设置里选择）'} @ ${getConfig().api.baseUrl}`);
@@ -1730,6 +1849,11 @@ export function createApp({ log = console.log } = {}) {
     await orchestrator.abortAll();
     onebot.close();
     server.close();
+    // 退出前把会话索引缓存立即落盘（平时是防抖写，别把这个窗口丢掉）
+    try { sessions.flushIndexCache(); } catch { /* ignore */ }
+    try { pluginWatcher?.close?.(); } catch { /* ignore */ }
+    try { orchestrator.stopReminderLoop(); } catch { /* ignore */ }
+    releaseInstanceLock();
     // 内置启动的 SnowLuma：QQ Agent 退出时一并关掉，避免留一个无窗口的后台进程。
     // 注意：SnowLuma 退出时不一定能立刻把 config 落盘，但我们的 stop 不会再去读它，
     // 下次启动会读到完整文件。

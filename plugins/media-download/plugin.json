@@ -1,0 +1,49 @@
+{
+  "id": "media-download",
+  "name": "B站 / 抖音视频下载",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "category": "media",
+  "description": "群里出现 B站 / 抖音链接时自动下载并转发该视频（或图文帖）。开了就一定触发，不需要模型判断。依赖第三方接口，默认关闭。",
+  "enabledByDefault": false,
+  "capabilities": [
+    "media.download"
+  ],
+  "requires": [],
+  "settings": {
+    "bilibiliCookie": "",
+    "maxDurationMin": 10,
+    "maxSizeMB": 100,
+    "quality": "low",
+    "douyinCookie": ""
+  },
+  "configSchema": {
+    "bilibiliCookie": {
+      "type": "string",
+      "label": "B站 SESSDATA",
+      "description": "可选的 SESSDATA；留空尝试匿名，但不保证可用。",
+      "secret": true
+    },
+    "maxDurationMin": {
+      "type": "number",
+      "label": "时长上限（分钟）",
+      "description": "超过此时长的视频不会下载，默认 10 分钟。"
+    },
+    "maxSizeMB": {
+      "type": "number",
+      "label": "体积上限（MB）",
+      "description": "下载文件最大体积，默认 100 MB。"
+    },
+    "quality": {
+      "type": "string",
+      "label": "画质偏好",
+      "description": "low 或 high；B站优先选择低码率或高码率。"
+    },
+    "douyinCookie": {
+      "type": "string",
+      "label": "抖音 Cookie",
+      "description": "可选的抖音网页 Cookie（如 sessionid）。留空则匿名访问，登录可见/高清源可能被拒。",
+      "secret": true
+    }
+  }
+}

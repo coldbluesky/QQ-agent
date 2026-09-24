@@ -1,0 +1,82 @@
+{
+  "id": "image-generate",
+  "name": "文生图",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "category": "media",
+  "description": "用你自带的画图接口（OpenAI 兼容的 /images/generations）生成图片并发出去。",
+  "author": "QQ Agent",
+  "enabledByDefault": true,
+  "capabilities": [],
+  "requires": [],
+  "permissions": [
+    "web_fetch"
+  ],
+  "settings": {
+    "baseUrl": "",
+    "apiKey": "",
+    "model": "dall-e-3",
+    "defaultSize": "1024x1024",
+    "responseFormat": "auto",
+    "extraBody": "",
+    "timeoutMs": 60000,
+    "downloadTimeoutMs": 60000,
+    "maxRetries": 1,
+    "maxImageMB": 8
+  },
+  "configSchema": {
+    "baseUrl": {
+      "type": "string",
+      "label": "接口地址",
+      "description": "画图服务的 Base URL，例如 https://api.openai.com/v1。留空则本功能不可用（技能页会显示「依赖未满足」）。"
+    },
+    "apiKey": {
+      "type": "string",
+      "label": "API Key",
+      "secret": true,
+      "description": "画图服务的密钥。留空则本功能不可用。"
+    },
+    "model": {
+      "type": "string",
+      "label": "模型名",
+      "description": "画图模型，例如 dall-e-3 / flux-schnell / 你自建服务的模型名。"
+    },
+    "defaultSize": {
+      "type": "string",
+      "label": "默认尺寸",
+      "description": "模型没指定尺寸时用这个，例如 1024x1024 / 512x512。不同服务支持的尺寸不一样，填错会被接口拒绝。"
+    },
+    "responseFormat": {
+      "type": "enum",
+      "values": ["auto", "url", "b64_json"],
+      "label": "返回格式",
+      "description": "auto=先按 url 请求，被拒再退回 base64（推荐）。有些服务只支持其中一种，指定死会直接失败。"
+    },
+    "extraBody": {
+      "type": "string",
+      "label": "附加参数",
+      "description": "要额外塞进请求体的 JSON，例如 {\"quality\":\"hd\"}。留空表示不加。写错 JSON 会被忽略并记日志。"
+    },
+    "timeoutMs": {
+      "type": "number",
+      "label": "生成超时（毫秒）",
+      "description": "等画图接口返回的时间，下限 5000、上限 300000，默认 60000。画大图或排队慢的服务要调大。"
+    },
+    "downloadTimeoutMs": {
+      "type": "number",
+      "label": "下载超时（毫秒）",
+      "description": "从图床把生成好的图取回来的时间，下限 5000、上限 300000，默认 60000。海外图床常见「响应头秒回、body 很慢」，这个值就是为它准备的。"
+    },
+    "maxRetries": {
+      "type": "number",
+      "label": "失败重试次数",
+      "description": "生成请求失败（网络类错误）重试几次，默认 1。注意：**下载**失败是免费重试的，不受这里限制。"
+    },
+    "maxImageMB": {
+      "type": "number",
+      "label": "图片体积上限（MB）",
+      "description": "超过就拒绝并让你换更小的尺寸，默认 8。既防超大图吃满内存，也避免发到群里失败。"
+    }
+  },
+  "prompt": null
+}
