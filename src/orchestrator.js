@@ -59,6 +59,9 @@ export class Orchestrator {
     this.wakeTimers = new Map();       // chatKey -> timer
     this.pendingWake = new Set();      // 防抖中等待聚批的 chatKey
     this.pendingSessions = new Map();  // chatKey -> waiting sessionId（防抖期可见的“等待中”会话）
+    // chatKey -> { fp, roll }：这一批未读的随机档掷骰值。同一批只掷一次，
+    // 供"预判 → 实跑"共用（见 #rollForBatch）。
+    this.tierRolls = new Map();
     this.consolidating = new Set();    // 正在整理记忆的 chatKey
     this.folding = new Set();          // 正在折叠前情摘要的 chatKey
     this.runningChats = new Set();     // 正在运行的 chatKey
@@ -114,16 +117,51 @@ export class Orchestrator {
   #predictTier(chatKey) {
     const cfg = getConfig();
     const entries = this.store.peekUnread(chatKey, 200) || [];
+    // 随机档的掷骰结果**钉在这一批未读上**（同一批只掷一次）。
+    // 这是 resolveContextTier 文档里的硬要求：不固定的话，预判（scheduleWake）
+    // 与实跑（wake）会各掷一次，于是约三成概率出现"先亮出等待中会话、
+    // 随后又判定不响应、会话被干净丢弃"的抖动 —— 用户只看到等了个寂寞。
+    const roll = this.#rollForBatch(chatKey, entries);
     const r = resolveContextTier({
       triggerEntries: entries,
       selfNickname: cfg.persona?.selfNickname || this.onebot.selfNickname || '',
       botName: cfg.persona?.botName || '',
       selfId: cfg.onebot?.selfId || this.onebot.selfId || '',
-      cfg: storeConfigForChat(chatKey)   // 按会话取档位：统一开关关闭时各群可以有独立滑条
+      cfg: storeConfigForChat(chatKey),   // 按会话取档位：统一开关关闭时各群可以有独立滑条
+      roll
     });
     // 没有未读就不算"需要响应"（防抖窗口刚建立时的空转）
-    if (entries.length === 0) return { ...r, shouldRespond: false, reason: '无未读' };
-    return r;
+    if (entries.length === 0) return { ...r, shouldRespond: false, reason: '无未读', roll };
+    // 把 roll 带出去：触发批被 drain 之后未读指纹变了，后续要**显式**复用它
+    return { ...r, roll };
+  }
+
+  /**
+   * 取"这一批未读"的随机掷骰值：同一批只掷一次，指纹变了才重掷。
+   *
+   * 指纹取（条数、首条 id、末条 id）—— 来了新消息、或旧消息被处理掉，指纹都会变，
+   * 天然对应"新的一批重新掷骰"。这样不必在十几个 return 分支里手工清理。
+   *
+   * @returns {number} 0~100 的掷骰值
+   */
+  #rollForBatch(chatKey, entries) {
+    const list = Array.isArray(entries) ? entries : [];
+    const fp = `${list.length}:${list[0]?.id ?? ''}:${list[list.length - 1]?.id ?? ''}`;
+    const cur = this.tierRolls.get(chatKey);
+    if (cur && cur.fp === fp) return cur.roll;
+
+    const roll = Math.random() * 100;
+    this.tierRolls.set(chatKey, { fp, roll });
+    // 容量控制：每个会话只留一条，但"聊过的会话"会一直累积 —— 超上限丢最早的一批。
+    // 丢了只是下次重新掷骰，没有任何正确性影响。
+    if (this.tierRolls.size > 500) {
+      let n = 100;
+      for (const k of this.tierRolls.keys()) {
+        this.tierRolls.delete(k);
+        if (--n <= 0) break;
+      }
+    }
+    return roll;
   }
 
   scheduleWake(chatKey, delay = null) {
@@ -418,6 +456,8 @@ export class Orchestrator {
 
     const cfgNow = getConfig();
     let pendingEntries = [];
+    // 预判时钉住的随机掷骰值：触发批被 drain 后未读指纹会变，必须显式带下去复用
+    let fixedRoll = null;
     if (!proactive) {
       // peekUnread 只看不取，limit 给足以免漏判（判定用的是这批的文本）
       pendingEntries = this.store.peekUnread(chatKey, 200) || [];
@@ -428,6 +468,7 @@ export class Orchestrator {
 
       // 复用 scheduleWake 那一份判定逻辑，避免两处各写一套、日后漂移
       const tierResult0 = this.#predictTier(chatKey);
+      fixedRoll = tierResult0.roll ?? null;
 
       if (tierResult0.shouldRespond === false) {
         // 不响应：沉入历史（已读），不产生会话、不消耗 token。
@@ -475,7 +516,11 @@ export class Orchestrator {
         selfNickname: cfgNow.persona?.selfNickname || this.onebot.selfNickname || '',
         botName: cfgNow.persona?.botName || '',
         selfId: cfgNow.onebot?.selfId || this.onebot.selfId || '',
-        cfg: storeConfigForChat(chatKey)   // 与 #predictTier 同一来源，保证预判/实跑一致
+        cfg: storeConfigForChat(chatKey),  // 与 #predictTier 同一来源，保证预判/实跑一致
+        // 复用预判时钉住的掷骰值。⚠️ 这里必须显式传：触发批此时已被 drain，
+        // 未读指纹随之改变，不传就会重新掷一次 —— 那正是"预判命中、实跑不中"
+        // （UI 上先显示等待中、随后会话被丢弃）的来源。
+        roll: fixedRoll
       });
 
     this.runningChats.add(chatKey);

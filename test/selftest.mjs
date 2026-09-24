@@ -1871,6 +1871,56 @@ refs:
     pass('上传安装：删除后重扫不再出现（不留残留）');
   }
 
+  // ── 随机档：预判与实跑必须复用同一次掷骰 ──
+  // 曾经的抖动（用户报的"一直等待"）：防抖窗口建立时预判命中 → 会话页亮出
+  // "等待中"；2 秒后实跑**又掷一次**骰子，没中就把它干净丢弃。用户看到的是
+  // "等了半天，然后什么都没有"。prompt.js 的 resolveContextTier 文档明确要求
+  // 调用方把随机结果固定下来，这里就是那条要求。
+  //
+  // 复现手法：把两次掷骰的结果人为错开 —— 第 1 次（预判）命中、之后都不命中。
+  // 修复后实跑直接复用预判的值，不再调 Math.random，会话因此不会被丢弃。
+  {
+    const base2 = `http://127.0.0.1:${cfg.server.port}`;
+    await fetch(`${base2}/api/config`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      // 档位 3 = 随机档；清空关键词，确保只剩"随机"这一条触发路径。
+      // wakeDelayMs 临时放大到 2500ms：本文件的 fixture 为了跑得快设的是 300ms，
+      // 那样还没等到"防抖窗口内"就已经开跑了，测不到"等待中"这一刻。
+      body: JSON.stringify({
+        wakeDelayMs: 2500,
+        store: { contextTier: 3, randomPercent: 50, keywords: [], unifiedTier: true }
+      })
+    });
+    const origRandom = Math.random;
+    const rolls = [0.1, 0.9];   // 第 1 次命中（10 < 50），第 2 次不命中（90）
+    Math.random = () => (rolls.length ? rolls.shift() : 0.9);
+    try {
+      const idx = llm.state.requests.length;
+      llm.state.script[idx] = { content: '（这轮不说话）' };
+      llm.state.script[idx + 1] = { content: '（这轮不说话）' };
+      pushGroupMsg(333, '王五', '今晚吃什么好呢', 7801);
+
+      await sleep(1200);   // 仍在防抖窗口内（wakeDelayMs 默认 2000）
+      const during = app.sessions.listSummaries(20)
+        .find((s) => String(s.trigger || '').includes('今晚吃什么'));
+      assert.ok(during, '预判命中时应立刻出现"等待中"会话');
+      assert.strictEqual(during.status, 'waiting', '此刻处于防抖等待状态');
+
+      await sleep(4500);   // 等过防抖窗口 + 跑完
+      const settle = app.sessions.listSummaries(20)
+        .find((s) => String(s.trigger || '').includes('今晚吃什么'));
+      assert.ok(settle, '实跑复用预判的掷骰值 → 会话不会被丢弃（旧实现会在这里消失）');
+      assert.notStrictEqual(settle.status, 'waiting', '会话已跑完');
+      pass('随机档：预判与实跑复用同一次掷骰（不再"显示等待中、随后被丢弃"）');
+    } finally {
+      Math.random = origRandom;
+      await fetch(`${base2}/api/config`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ wakeDelayMs: 300, drainDelayMs: 200, store: { contextTier: 4, randomPercent: 100 } })
+      }).catch(() => {});
+    }
+  }
+
   // ── 收尾 ──
   await app.stop();
   onebotWs.close();
