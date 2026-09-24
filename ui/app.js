@@ -2649,6 +2649,7 @@ function renderSettingsSidebar() {
   if (!sidebar) return;
   const menu = [
     ['api', '模型 API'],
+    ['voice', '语音输出'],
     ['search', '搜索服务'],
     ['memory', '记忆'],
     ['persona', '人设'],
@@ -2697,6 +2698,7 @@ function renderSettingsSection(c) {
   const sec = state.settingsSection || 'api';
   const sections = {
     api: () => renderApiSection(c),
+    voice: () => renderVoiceSection(c),
     search: () => renderSearchSection(c),
     memory: () => renderMemorySettingsSection(c),
     persona: () => renderPersonaSection(c),
@@ -2749,6 +2751,7 @@ function renderApiSection(c) {
     <div class="checkbox-row"><input type="checkbox" id="cfg-vision" ${c.api.vision !== false ? 'checked' : ''} />
       <label for="cfg-vision">图片输入（关闭则移除看图工具，模型只会看到 [图片] 占位符）</label>
       <span id="vision-switch-hint" class="muted" style="font-size:12px;align-self:center"></span></div>
+
     <div class="settings-divider"></div>
 
     <h3>成本核算</h3>
@@ -2810,6 +2813,195 @@ function renderApiSection(c) {
       <div class="field"><button class="btn btn-danger" id="delete-model-btn">删除模型…</button></div>
     </div>
     <div class="hint" id="provider-action-hint"></div>`;
+}
+
+// 腾讯云语音合成的「聊天向」音色（整理自官方《音色列表》）。
+// 只收录适合群聊的：超自然大模型音色（最自然）与大模型音色里的聊天类。
+// 精品音色（10xxxx）刻意不收录 —— 那是标准 TTS 腔，采样率也最高只到 16k；
+// 用户仍可通过「自定义」填任意 ID，所以这里不是白名单。
+const TENCENT_VOICE_GROUPS = [
+  {
+    label: '超自然大模型音色 · 女声（推荐）',
+    items: [
+      { id: 603007, name: '邻家女孩' },
+      { id: 502001, name: '智小柔' },
+      { id: 602005, name: '专业梓欣' },
+      { id: 602003, name: '爱小悠' },
+      { id: 402000, name: '云晓芙' },
+      { id: 403001, name: '云小和' },
+      { id: 502003, name: '智小敏' },
+      { id: 603004, name: '温柔小柠' }
+    ]
+  },
+  {
+    label: '超自然大模型音色 · 男声（推荐）',
+    items: [
+      { id: 502006, name: '智小悟' },
+      { id: 603006, name: '沉稳青叔' },
+      { id: 602004, name: '暖心阿灿' },
+      { id: 603005, name: '知心大林' },
+      { id: 603003, name: '随和老李' }
+    ]
+  },
+  {
+    label: '超自然大模型音色 · 童声 / 特色',
+    items: [
+      { id: 502007, name: '智小虎（童声）' },
+      { id: 403000, name: '云小朵（女童声）' },
+      { id: 603002, name: '软萌心心（男童声）' },
+      { id: 603000, name: '懂事少年' },
+      { id: 603001, name: '潇湘妹妹' }
+    ]
+  },
+  {
+    label: '大模型音色 · 聊天向',
+    items: [
+      { id: 501004, name: '月华（女声）' },
+      { id: 501005, name: '飞镜（男声）' },
+      { id: 501006, name: '千嶂（男声）' },
+      { id: 501007, name: '浅草（男声）' },
+      { id: 601011, name: '爱小川（男声）' },
+      { id: 601014, name: '爱小简（男声）' }
+    ]
+  },
+  {
+    label: '大模型音色 · 支持情感（可撒娇）',
+    items: [
+      { id: 601009, name: '爱小芊（女声）' },
+      { id: 601010, name: '爱小娇（女声）' },
+      { id: 601008, name: '爱小豪（男声）' }
+    ]
+  }
+];
+const TENCENT_VOICE_IDS = new Set(TENCENT_VOICE_GROUPS.flatMap((g) => g.items.map((v) => v.id)));
+// 下拉里代表"我自己填 ID"的哨兵值（不能和真实音色 ID 撞）
+const TENCENT_VOICE_CUSTOM = '__custom__';
+
+/** 当前界面选中的腾讯云音色 ID（下拉或自定义输入框）。 */
+function currentTencentVoiceType() {
+  const sel = $('#cfg-voice-voicetype');
+  if (!sel) return 0;
+  if (sel.value === TENCENT_VOICE_CUSTOM) return Number($('#cfg-voice-voicetype-custom')?.value) || 0;
+  return Number(sel.value) || 0;
+}
+
+function renderVoiceSection(c) {
+  // 语音服务类型：腾讯云走原生 TextToVoice，字段与 OpenAI 兼容模式完全不同，二选一显示。
+  // 独立成一个设置分区（而不是塞在「模型 API」里）：它有自己的服务商、凭据与格式约束，
+  // 和聊天模型那套是两条互不相干的链路。
+  const voiceIsTencent = c.voice?.type === 'tencent';
+  // 音色：在推荐列表里就直接选中它；不在（比如老的 101001）就落到「自定义」并回填数字框
+  const savedVoiceType = Number(c.voice?.tencent?.voiceType) || 0;
+  const voiceTypeIsCustom = !TENCENT_VOICE_IDS.has(savedVoiceType);
+  return `
+    <h3 id="settings-voice">语音输出（TTS）</h3>
+    <div class="hint" style="margin-bottom:10px">开启后模型会拿到 <code>send_voice</code> 工具，可以把要说的话合成语音发出去。未配齐时工具不会注册给模型。</div>
+
+    <div class="checkbox-row"><input type="checkbox" id="cfg-voice-enabled" ${c.voice?.enabled ? 'checked' : ''} />
+      <label for="cfg-voice-enabled">允许模型发语音（关闭则移除 send_voice 工具，模型完全不知道有语音）</label>
+      <span id="voice-switch-hint" class="muted" style="font-size:12px;align-self:center"></span></div>
+
+    <div class="field"><label>服务类型</label>
+      <select id="cfg-voice-type">
+        <option value="openai" ${voiceIsTencent ? '' : 'selected'}>OpenAI 兼容（POST {baseUrl}/audio/speech）</option>
+        <option value="tencent" ${voiceIsTencent ? 'selected' : ''}>腾讯云语音合成（TextToVoice，TC3 签名）</option>
+      </select>
+      <div class="hint" id="voice-type-hint" style="margin-top:4px"></div></div>
+
+    <!-- OpenAI 兼容模式 -->
+    <div id="voice-openai-fields">
+      <div class="field-row">
+        <div class="field"><label>复用模型提供商</label>
+          <select id="cfg-voice-provider">
+            <option value="" ${!c.voice?.provider ? 'selected' : ''}>不使用目录（用聊天模型的地址与 Key）</option>
+            ${(state.providers || []).map((p) => `<option value="${esc(p.id)}" ${c.voice?.provider === p.id ? 'selected' : ''}>${esc(p.displayName || p.id)}</option>`).join('')}
+          </select>
+          <div class="hint">选中后自动用该提供商的地址与 Key；下方填写会覆盖它。</div></div>
+        <div class="field"><label>语音模型</label>
+          <input type="text" id="cfg-voice-model" placeholder="例如 gpt-4o-mini-tts / tts-1" value="${esc(c.voice?.model || '')}" />
+          <div class="hint">留空则工具不会启用。硅基流动填 FunAudioLLM/CosyVoice2-0.5B。</div></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>语音接口 Base URL（可留空）</label>
+          <input type="text" id="cfg-voice-baseurl" placeholder="例如 https://api.siliconflow.cn/v1" value="${esc(c.voice?.baseUrl || '')}" />
+          <div class="hint">程序会在后面自动拼 <code>/audio/speech</code>，所以只填到 <code>/v1</code> 为止，别把端点整个填进来。</div></div>
+        <div class="field"><label>语音 API Key（可留空）</label>
+          <div style="display:flex;gap:8px">
+            <input type="password" id="cfg-voice-apikey" value="${esc(c.voice?.hasApiKey ? '******' : '')}" placeholder="留空则沿用聊天模型的 Key" autocomplete="new-password" style="flex:1" />
+            <button class="btn btn-small" id="cfg-voice-apikey-toggle" type="button">显示</button>
+          </div></div>
+      </div>
+      <div class="field"><label>音色</label>
+        <input type="text" id="cfg-voice-name" placeholder="alloy" value="${esc(c.voice?.voice || 'alloy')}" />
+        <div class="hint">各厂商取值不同：alloy / nova（OpenAI）、FunAudioLLM/CosyVoice2-0.5B:alex（硅基流动）、Fritz-PlayAI（Groq）。</div></div>
+    </div>
+
+    <!-- 腾讯云模式 -->
+    <div id="voice-tencent-fields">
+      <div class="field-row">
+        <div class="field"><label>SecretId</label>
+          <input type="text" id="cfg-voice-secretid" value="${c.voice?.tencent?.hasSecretId ? '******' : ''}" placeholder="AKID..." autocomplete="off" />
+          <div class="hint">建议用子账号凭据，别用主账号密钥。</div></div>
+        <div class="field"><label>SecretKey</label>
+          <input type="password" id="cfg-voice-secretkey" value="${c.voice?.tencent?.hasSecretKey ? '******' : ''}" placeholder="留空则保持已保存的值" autocomplete="new-password" /></div>
+      </div>
+      <div class="field"><label>地域 Region</label>
+        <input type="text" id="cfg-voice-region" placeholder="ap-guangzhou" value="${esc(c.voice?.tencent?.region || 'ap-guangzhou')}" style="max-width:260px" /></div>
+
+      <div class="field"><label>音色（VoiceType）</label>
+        <select id="cfg-voice-voicetype">
+          ${TENCENT_VOICE_GROUPS.map((g) => `<optgroup label="${esc(g.label)}">${g.items
+            .map((v) => `<option value="${v.id}" ${savedVoiceType === v.id ? 'selected' : ''}>${esc(`${v.name} · ${v.id}`)}</option>`)
+            .join('')}</optgroup>`).join('')}
+          <option value="${TENCENT_VOICE_CUSTOM}" ${voiceTypeIsCustom ? 'selected' : ''}>自定义（手动填音色 ID）</option>
+        </select>
+        <input type="number" id="cfg-voice-voicetype-custom" min="1" placeholder="填腾讯云音色 ID，例如 101001"
+          value="${voiceTypeIsCustom && savedVoiceType ? savedVoiceType : ''}"
+          style="margin-top:6px;max-width:260px;${voiceTypeIsCustom ? '' : 'display:none'}" />
+        <div class="hint">超自然大模型音色最自然；精品音色（10xxxx）是标准 TTS 腔、采样率也最高 16k，故未收录。完整列表见腾讯云《音色列表》。留空则工具不会启用。</div></div>
+
+      <div class="field-row">
+        <div class="field"><label>采样率</label>
+          <select id="cfg-voice-samplerate">
+            ${[8000, 16000, 24000].map((r) => `<option value="${r}" ${Number(c.voice?.tencent?.sampleRate ?? 24000) === r ? 'selected' : ''}>${r} Hz</option>`).join('')}
+          </select>
+          <div class="hint">24k 更清晰，但只有超自然/大模型音色支持；精品音色（10xxxx）最高 16k，配错会报错。</div></div>
+        <div class="field"><label>音量（-10 ~ 10）</label>
+          <input type="number" id="cfg-voice-volume" min="-10" max="10" step="1" value="${esc(c.voice?.tencent?.volume ?? 0)}" /></div>
+        <div class="field"><label>主语言</label>
+          <select id="cfg-voice-primarylang">
+            <option value="1" ${Number(c.voice?.tencent?.primaryLanguage ?? 1) === 1 ? 'selected' : ''}>中文</option>
+            <option value="2" ${Number(c.voice?.tencent?.primaryLanguage ?? 1) === 2 ? 'selected' : ''}>英文</option>
+          </select></div>
+      </div>
+      <div class="hint">走腾讯云原生 <code>TextToVoice</code>：TC3-HMAC-SHA256 签名，音频以 base64 返回。单次文本上限 150 字；本机时间需与服务端相差 5 分钟以内，否则会报签名过期。语速会折算成腾讯云的 Speed，有效范围 0.6x~2.5x，超出会被钳住。</div>
+    </div>
+
+    <div class="settings-divider"></div>
+
+    <div class="field-row">
+      <div class="field"><label>音频格式</label>
+        <select id="cfg-voice-format">
+          ${['mp3', 'opus', 'aac', 'flac', 'wav', 'pcm'].map((f) => `<option value="${f}" ${(c.voice?.format || 'mp3') === f ? 'selected' : ''}>${f}</option>`).join('')}
+        </select>
+        <div class="hint" id="voice-format-hint" style="margin-top:4px"></div></div>
+      <div class="field"><label>语速（1 = 原速）</label>
+        <input type="number" id="cfg-voice-speed" step="0.05" min="0.25" max="4" value="${esc(c.voice?.speed ?? 1)}" /></div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>单条语音最长字数</label>
+        <input type="number" id="cfg-voice-maxchars" min="1" max="500" value="${esc(c.voice?.maxChars ?? 200)}" />
+        <div class="hint">超出会被截断，防止模型拿语音念长文。腾讯云模式按 150 字封顶生效。</div></div>
+      <div class="field"><label>本地语音文件保留个数（0 = 不限制）</label>
+        <input type="number" id="cfg-voice-keepfiles" min="0" value="${esc(c.voice?.keepFiles ?? 100)}" />
+        <div class="hint">存在 data/voice/，超出后按时间从旧到新清理。</div></div>
+    </div>
+    <div style="display:flex;gap:8px;margin:8px 0;align-items:center;flex-wrap:wrap">
+      <button class="btn btn-small" id="voice-test-btn">测试并试听</button>
+      <span id="voice-test-result" class="muted" style="font-size:12px"></span>
+      <audio id="voice-test-audio" controls style="height:30px;display:none"></audio>
+    </div>
+    <div class="hint">协议端需要支持发送 record 消息段（SnowLuma / NapCat 均可）。若发出去的声音放不响，多半是格式问题，把「音频格式」换成 wav 再试。</div>`;
 }
 
 
@@ -3758,6 +3950,150 @@ function bindSettingsEvents(c) {
   }
   syncVisionSwitch(c.api.provider, c.api.model);
 
+  // ── 语音输出（TTS）──
+  // 服务类型决定显示哪一组字段：openai 走 /audio/speech，tencent 走原生 TextToVoice。
+  const voiceTypeSel = $('#cfg-voice-type');
+  const voiceEnabledBox = $('#cfg-voice-enabled');
+  const voiceIsTencent = () => (voiceTypeSel?.value || 'openai') === 'tencent';
+  // 输入框里是 '******' 表示"已保存但未改动"，同样算填过
+  const voiceHasVal = (sel) => {
+    const v = ($(sel)?.value || '').trim();
+    return Boolean(v) && v !== '******';
+  };
+
+  // 缺字段时后端 voiceReady() 判定不通过、工具不会注册，这里当场点破，
+  // 免得用户以为开好了却一直等不到语音。
+  const syncVoiceHint = () => {
+    const hint = $('#voice-switch-hint');
+    if (!hint || !voiceEnabledBox) return;
+    if (!voiceEnabledBox.checked) { hint.textContent = ''; return; }
+    const missing = (voiceIsTencent()
+      ? [
+        voiceHasVal('#cfg-voice-secretid') ? '' : 'SecretId',
+        voiceHasVal('#cfg-voice-secretkey') ? '' : 'SecretKey',
+        currentTencentVoiceType() ? '' : '音色 ID'
+      ]
+      : [voiceHasVal('#cfg-voice-model') ? '' : '语音模型']
+    ).filter(Boolean);
+    hint.textContent = missing.length ? `⚠ 还没填 ${missing.join(' / ')}，工具不会启用` : '';
+  };
+
+  // 音色下拉：只有选到「自定义」时才露出手填 ID 的输入框
+  const voiceTypeSelect = $('#cfg-voice-voicetype');
+  if (voiceTypeSelect) {
+    const syncVoiceTypeCustom = () => {
+      const custom = $('#cfg-voice-voicetype-custom');
+      if (custom) custom.style.display = voiceTypeSelect.value === TENCENT_VOICE_CUSTOM ? '' : 'none';
+      syncVoiceHint();
+    };
+    voiceTypeSelect.addEventListener('change', syncVoiceTypeCustom);
+    syncVoiceTypeCustom();
+  }
+
+  const syncVoiceMode = () => {
+    const isTencent = voiceIsTencent();
+    const openaiBox = $('#voice-openai-fields');
+    const tencentBox = $('#voice-tencent-fields');
+    if (openaiBox) openaiBox.style.display = isTencent ? 'none' : '';
+    if (tencentBox) tencentBox.style.display = isTencent ? '' : 'none';
+    const typeHint = $('#voice-type-hint');
+    if (typeHint) {
+      typeHint.textContent = isTencent
+        ? '腾讯云原生协议：SecretId + SecretKey 做 TC3 签名，音频以 base64 返回，与 OpenAI 模式互不通用。'
+        : '任何实现了 POST {baseUrl}/audio/speech 的服务：OpenAI 官方 / 硅基流动 / Groq / 中转站等。';
+    }
+    // 格式钳制：腾讯云没有 opus / aac / flac
+    const fmt = $('#cfg-voice-format');
+    if (fmt && isTencent && !['mp3', 'wav', 'pcm'].includes(fmt.value)) fmt.value = 'mp3';
+    const fmtHint = $('#voice-format-hint');
+    if (fmtHint) {
+      fmtHint.textContent = isTencent
+        ? '腾讯云只支持 mp3 / wav / pcm，选了别的会按 mp3 处理。'
+        : '发出去放不响时优先换 wav 再试。';
+    }
+    syncVoiceHint();
+  };
+
+  if (voiceTypeSel) {
+    voiceTypeSel.addEventListener('change', syncVoiceMode);
+    syncVoiceMode();
+  }
+
+  // 「测试并试听」用界面上当前的值试，不用先点保存：没改动的密钥传掩码占位，
+  // 其余原样送过去（服务端只把非空值当覆盖）。
+  const voiceTestBtn = $('#voice-test-btn');
+  if (voiceTestBtn) voiceTestBtn.addEventListener('click', async () => {
+    const out = $('#voice-test-result');
+    const audio = $('#voice-test-audio');
+    const isTencent = voiceIsTencent();
+    const enteredVoiceKey = ($('#cfg-voice-apikey')?.value || '').trim();
+    const overrides = {
+      type: isTencent ? 'tencent' : 'openai',
+      format: $('#cfg-voice-format')?.value || 'mp3',
+      speed: Number($('#cfg-voice-speed')?.value) || 1,
+      ...(isTencent
+        ? {
+          tencent: {
+            // 掩码 / 空串由服务端当作"未填"，会回退到已保存的值
+            secretId: ($('#cfg-voice-secretid')?.value || '').trim(),
+            secretKey: ($('#cfg-voice-secretkey')?.value || '').trim(),
+            region: ($('#cfg-voice-region')?.value || '').trim(),
+            voiceType: currentTencentVoiceType(),
+            sampleRate: Number($('#cfg-voice-samplerate')?.value) || 16000,
+            volume: Number($('#cfg-voice-volume')?.value) || 0,
+            primaryLanguage: Number($('#cfg-voice-primarylang')?.value) || 1
+          }
+        }
+        : {
+          provider: $('#cfg-voice-provider')?.value || '',
+          baseUrl: ($('#cfg-voice-baseurl')?.value || '').trim(),
+          model: ($('#cfg-voice-model')?.value || '').trim(),
+          voice: ($('#cfg-voice-name')?.value || '').trim(),
+          ...(enteredVoiceKey ? { apiKey: enteredVoiceKey } : {})
+        })
+    };
+    voiceTestBtn.disabled = true;
+    out.textContent = '合成中…';
+    try {
+      const r = await api('/api/voice/test', { method: 'POST', body: JSON.stringify({ overrides }) });
+      const result = r.result || {};
+      if (result.ok) {
+        const kb = Math.max(1, Math.round((result.bytes || 0) / 1024));
+        out.textContent = `成功 ✓ ${result.latencyMs}ms · ${result.format} · ${kb} KB · ${result.voice}`;
+        if (audio && result.preview) {
+          audio.src = result.preview;
+          audio.style.display = '';
+          // 自动播放可能被浏览器策略拦下，拦了就留给用户自己点播放
+          audio.play().catch(() => { /* ignore */ });
+        }
+      } else {
+        out.textContent = `失败：${result.note || '未知错误'}`;
+        if (audio) { audio.style.display = 'none'; audio.removeAttribute('src'); }
+      }
+    } catch (e) {
+      out.textContent = `失败：${e.message}`;
+    } finally {
+      voiceTestBtn.disabled = false;
+    }
+  });
+
+  const voiceKeyToggle = $('#cfg-voice-apikey-toggle');
+  if (voiceKeyToggle) voiceKeyToggle.addEventListener('click', () => {
+    const input = $('#cfg-voice-apikey');
+    if (!input) return;
+    const show = input.type === 'password';
+    input.type = show ? 'text' : 'password';
+    voiceKeyToggle.textContent = show ? '隐藏' : '显示';
+  });
+
+  // 字段一填就自动消警
+  voiceEnabledBox?.addEventListener('change', syncVoiceHint);
+  for (const sel of ['#cfg-voice-model', '#cfg-voice-secretid', '#cfg-voice-secretkey', '#cfg-voice-voicetype-custom']) {
+    const node = $(sel);
+    if (node) node.addEventListener('input', syncVoiceHint);
+  }
+  syncVoiceHint();
+
   // 模型目录“支持图片输入/不支持图片输入”徽标开关
   function applyShowVision() {
     const show = state.config?.ui?.showVision !== false;
@@ -4502,6 +4838,53 @@ async function saveConfig({ quiet = false } = {}) {
         patch.api.apiKey = enteredApiKey;
       }
     }
+  }
+
+  if (sec === 'voice') {
+    // hasXxx 是服务端脱敏时补的标记（不是配置字段），回传前先丢掉，别写进 config.json。
+    const voicePatch = { ...(c.voice || {}) };
+    delete voicePatch.hasApiKey;
+    delete voicePatch.tencent;
+    const tencentPatch = { ...(c.voice?.tencent || {}) };
+    delete tencentPatch.hasSecretId;
+    delete tencentPatch.hasSecretKey;
+    const enteredVoiceKey = val('#cfg-voice-apikey', '').trim();
+    const enteredSecretId = val('#cfg-voice-secretid', '').trim();
+    const enteredSecretKey = val('#cfg-voice-secretkey', '').trim();
+    // 音色：下拉里选中了具体音色就用它；选「自定义」时读旁边的数字输入框。
+    // 取不到控件时回退到已保存值 —— 否则会误存成 0，把语音功能弄成"未配齐"。
+    const savedVoiceType = Number(c.voice?.tencent?.voiceType) || 0;
+    const voiceTypePick = String(val('#cfg-voice-voicetype', '') || '');
+    const voiceTypeValue = !voiceTypePick
+      ? savedVoiceType
+      : voiceTypePick === TENCENT_VOICE_CUSTOM
+        ? Number(val('#cfg-voice-voicetype-custom', savedVoiceType)) || savedVoiceType
+        : Number(voiceTypePick) || savedVoiceType;
+    patch.voice = {
+      ...voicePatch,
+      enabled: chk('#cfg-voice-enabled', c.voice?.enabled === true),
+      type: val('#cfg-voice-type', c.voice?.type || 'openai') === 'tencent' ? 'tencent' : 'openai',
+      provider: val('#cfg-voice-provider', c.voice?.provider || '').trim(),
+      baseUrl: val('#cfg-voice-baseurl', c.voice?.baseUrl || '').trim(),
+      model: val('#cfg-voice-model', c.voice?.model || '').trim(),
+      voice: val('#cfg-voice-name', c.voice?.voice || 'alloy').trim() || 'alloy',
+      format: val('#cfg-voice-format', c.voice?.format || 'mp3'),
+      speed: Number(val('#cfg-voice-speed', c.voice?.speed ?? 1)) || 1,
+      maxChars: Math.max(1, Number(val('#cfg-voice-maxchars', c.voice?.maxChars ?? 200)) || 200),
+      keepFiles: Math.max(0, Number(val('#cfg-voice-keepfiles', c.voice?.keepFiles ?? 100)) || 0),
+      // 密钥只在输入了新值时写；掩码/留空都表示"不改"（c.voice 里本来就没有真密钥）
+      ...(enteredVoiceKey && enteredVoiceKey !== '******' ? { apiKey: enteredVoiceKey } : {}),
+      tencent: {
+        ...tencentPatch,
+        region: val('#cfg-voice-region', c.voice?.tencent?.region || 'ap-guangzhou').trim() || 'ap-guangzhou',
+        voiceType: voiceTypeValue,
+        sampleRate: Number(val('#cfg-voice-samplerate', c.voice?.tencent?.sampleRate ?? 16000)) || 16000,
+        volume: Number(val('#cfg-voice-volume', c.voice?.tencent?.volume ?? 0)) || 0,
+        primaryLanguage: Number(val('#cfg-voice-primarylang', c.voice?.tencent?.primaryLanguage ?? 1)) || 1,
+        ...(enteredSecretId && enteredSecretId !== '******' ? { secretId: enteredSecretId } : {}),
+        ...(enteredSecretKey && enteredSecretKey !== '******' ? { secretKey: enteredSecretKey } : {})
+      }
+    };
   }
 
   if (sec === 'search') {

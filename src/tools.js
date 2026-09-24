@@ -65,6 +65,7 @@ function imageParts(text, dataUrls) {
  * ctx: {
  *   chatKey, kind, chatId, selfId, selfNickname, botName,
  *   onebot, store, memory, stickers, sender, session,
+ *   tts,  语音合成器（未启用语音时为 null —— send_voice 届时不会注册）
  *   emit  (事件上报给 UI/日志)
  * }
  */
@@ -132,6 +133,46 @@ export function buildToolDefs() {
           return ok({ sent: true, messageId: result?.message_id ?? null, note: '表情已发送。' });
         } catch (error) {
           return err(error?.message ?? error);
+        }
+      }
+    },
+    {
+      name: 'send_voice',
+      description: '发一条语音（把你的话用语音合成读出来，一条消息只有语音、不能附带文字）。适合：撒娇/叹气/喊人/一句带情绪的口语短句，或群友明确说"你发个语音""你说话呀"时。text 只写【要读出来的话本身】，是口语短句，不要写"（小声）""*笑*"这类舞台提示、表情符号或 Markdown，否则会被原样念出来。语音比打字打扰得多：一次最多一条，不要连发，不要拿它念长文或讲道理。',
+      parameters: {
+        type: 'object',
+        properties: {
+          text: { type: 'string', description: '要读出来的话（简短口语，建议 ≤40 字）' },
+          replyToMessageId: { type: ['integer', 'string'], description: '可选：要引用的消息 id（聊天记录里的 #数字）' },
+          atUserId: { type: ['integer', 'string'], description: '可选：要 @ 的 QQ 号' }
+        },
+        required: ['text']
+      },
+      async execute(ctx, args) {
+        try {
+          if (!ctx.tts) return err('语音功能未启用：请在「设置 → 语音输出」里开启并填好语音配置');
+          const raw = String(args.text ?? '').trim();
+          if (!raw) return err('语音内容为空');
+          const maxChars = Math.max(1, Number(getConfig().voice?.maxChars) || 200);
+          const spoken = raw.slice(0, maxChars);
+          const clip = await ctx.tts.speak(spoken);
+          const result = await ctx.sender.sendVoice(ctx.chatKey, { file: clip.file, text: spoken }, {
+            replyToMessageId: args.replyToMessageId ?? null,
+            atUserId: args.atUserId ?? null
+          });
+          ctx.session.sent.push({ type: 'voice', text: `[语音] ${spoken}`, at: result.at });
+          ctx.emit('session-update', ctx.session.id);
+          const note = ['语音已发送。不要输出"已发送"类汇报，继续思考下一步或直接结束。'];
+          if (raw.length > maxChars) note.push(`（内容超过 ${maxChars} 字，已截断到「${spoken}」）`);
+          return ok({
+            sent: true,
+            spoken,
+            format: clip.format,
+            bytes: clip.bytes,
+            note: note.join('')
+          });
+        } catch (error) {
+          return err(`发语音失败：${error?.message ?? error}`);
         }
       }
     },

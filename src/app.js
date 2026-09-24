@@ -22,6 +22,7 @@ import { startTelemetryLoop } from './telemetry.js';
 import { importFromDsh, currentProviders, setProviderKey, testAllProviders, testOneProvider, testModelChat, fetchModelsFrom, upsertProvider, addModelsToProvider, removeModelFromProvider } from './providers.js';
 import { scanModelsVision, visionResults, modelImageVerdict } from './vision-scan.js';
 import { builtinVisionResults } from './model-vision-docs.js';
+import { speak, testVoice } from './tts.js';
 import { createEventBus, todayKey } from './util.js';
 
 // 全局 fetch（undici）默认连接建立超时只有 10 秒，openrouter.ai 这类海外端点
@@ -285,7 +286,9 @@ export function createApp({ log = console.log } = {}) {
     onebot, store,
     onSent: ({ chatKey, text }) => log(`[发送 -> ${chatKey}] ${String(text).slice(0, 60)}`)
   });
-  const orchestrator = new Orchestrator({ store, memory, stickers, sender, sessions, onebot, emit });
+  // 语音合成器注入：工具能否拿到 tts 还取决于 voice.enabled（在 orchestrator 里过滤）。
+  // 这里始终注入，开关翻转时无需重建 orchestrator。
+  const orchestrator = new Orchestrator({ store, memory, stickers, sender, sessions, onebot, emit, tts: { speak } });
 
   // 远程价格表：启动即初始化（内部幂等；URL 为空则完全不动）
   initPriceFeed(cfg.api?.priceRemoteUrl || '');
@@ -1044,6 +1047,17 @@ export function createApp({ log = console.log } = {}) {
           .catch((error) => emit('vision-scan', { phase: 'error', error: String(error?.message ?? error) }))
           .finally(() => { visionScan.running = false; });
         return json(res, 202, { ok: true, started: true });
+      }
+
+      // ── 语音输出（TTS）：控制台「测试并试听」──
+      // overrides 允许用界面上还没保存的值直接试：空串不算覆盖，掩码 Key 会被忽略，
+      // 这样用户不用先点保存就能确认"地址/模型/音色"配得对不对。
+      if (pathname === '/api/voice/test' && method === 'POST') {
+        const body = await readBody(req).catch(() => ({}));
+        const text = String(body?.text ?? '').trim() || '你好，我是小鲸鱼，这是一条测试语音。';
+        const overrides = body?.overrides && typeof body.overrides === 'object' ? body.overrides : {};
+        const result = await testVoice(text.slice(0, 100), overrides);
+        return json(res, 200, { ok: true, result });
       }
 
       // ── 自定义搜索提供商（可添加多个，交互沿用模型提供商那套）──

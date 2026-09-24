@@ -107,7 +107,7 @@ try {
 
   // 取出渲染函数并执行
   const sections = [
-    'renderSettingsSection', 'renderApiSection', 'renderSearchSection',
+    'renderSettingsSection', 'renderApiSection', 'renderVoiceSection', 'renderSearchSection',
     'renderMemorySettingsSection', 'renderPersonaSection', 'renderAllowSection',
     'renderChatSection', 'renderDesktopSection', 'renderOnebotSection',
     'renderPersonaPicker', 'renderHealthCard'
@@ -143,6 +143,86 @@ try {
       console.log('  FAIL  ' + name + ' 抛错: ' + (e && e.message));
       results.push({ name, err: e && e.message });
     }
+  }
+
+  // ── 语音输出分区（从「模型 API」里拆出来的独立标签页）──
+  console.log('\n=== 语音输出分区 ===');
+  try {
+    // 1) 侧边栏切到 voice 后要真的渲染出语音设置
+    vm.runInContext("state.settingsSection = 'voice';", ctx);
+    const voiceHtml = ctx.renderSettingsSection(cfg);
+    const okDispatch = typeof voiceHtml === 'string'
+      && voiceHtml.includes('id="settings-voice"') && voiceHtml.includes('cfg-voice-type');
+    okDispatch ? pass++ : fail++;
+    console.log('  ' + (okDispatch ? 'OK   ' : 'FAIL ') + '切到 voice 分区后渲染出语音设置');
+    if (!okDispatch) console.log('    [调试] ' + JSON.stringify(String(voiceHtml || '').slice(0, 200)));
+
+    const renderWith = (type) => {
+      const c2 = JSON.parse(JSON.stringify(cfg));
+      c2.voice = { ...(c2.voice || {}), type };
+      return String(ctx.renderVoiceSection(c2));
+    };
+    const oaHtml = renderWith('openai');
+    const tcHtml = renderWith('tencent');
+
+    // 2) 服务类型下拉的选中项要跟配置一致（两组字段都在 DOM 里，靠 JS 切显隐）
+    const okOa = /<option value="openai" selected>/.test(oaHtml) && /<option value="tencent" >/.test(oaHtml);
+    okOa ? pass++ : fail++;
+    console.log('  ' + (okOa ? 'OK   ' : 'FAIL ') + 'type=openai 时选中 OpenAI 兼容');
+
+    const okTc = /<option value="tencent" selected>/.test(tcHtml) && /<option value="openai" >/.test(tcHtml);
+    okTc ? pass++ : fail++;
+    console.log('  ' + (okTc ? 'OK   ' : 'FAIL ') + 'type=tencent 时选中腾讯云');
+
+    // 3) 关键控件齐全（含腾讯云那组与试听播放器）
+    const needed = [
+      'voice-openai-fields', 'voice-tencent-fields', 'cfg-voice-secretid', 'cfg-voice-secretkey',
+      'cfg-voice-voicetype', 'cfg-voice-voicetype-custom', 'cfg-voice-region',
+      'cfg-voice-samplerate', 'cfg-voice-volume',
+      'cfg-voice-format', 'cfg-voice-speed', 'cfg-voice-maxchars', 'cfg-voice-keepfiles',
+      'voice-test-btn', 'voice-test-audio'
+    ];
+    const missing = needed.filter((id) => !tcHtml.includes(id));
+    missing.length === 0 ? pass++ : fail++;
+    console.log('  ' + (missing.length === 0 ? 'OK   ' : 'FAIL ') + '关键控件齐全'
+      + (missing.length ? ' -> 缺 ' + missing.join(', ') : ''));
+
+    // 4) 音色下拉：推荐列表里的音色要能选中，不在列表的自动落到「自定义」
+    const renderWithVoiceType = (vt) => {
+      const c3 = JSON.parse(JSON.stringify(cfg));
+      c3.voice = {
+        ...(c3.voice || {}),
+        type: 'tencent',
+        tencent: { ...(c3.voice?.tencent || {}), voiceType: vt }
+      };
+      return String(ctx.renderVoiceSection(c3));
+    };
+    const presetHtml = renderWithVoiceType(603007);
+    const okPreset = presetHtml.includes('value="603007" selected')
+      && presetHtml.includes('邻家女孩 · 603007')
+      && (presetHtml.match(/<optgroup /g) || []).length >= 5
+      && presetHtml.includes('爱小芊')                       // 支持情感的那组也在
+      && presetHtml.includes('max-width:260px;display:none'); // 手填框应隐藏
+    okPreset ? pass++ : fail++;
+    console.log('  ' + (okPreset ? 'OK   ' : 'FAIL ') + '音色在推荐列表里：选中该音色且隐藏手填框');
+
+    const legacyHtml = renderWithVoiceType(101001);   // 旧配置：精品音色，故意不在列表里
+    const okLegacy = legacyHtml.includes('value="__custom__" selected')
+      && /id="cfg-voice-voicetype-custom"[^>]*value="101001"/.test(legacyHtml)
+      && !legacyHtml.includes('max-width:260px;display:none');  // 手填框应露出
+    okLegacy ? pass++ : fail++;
+    console.log('  ' + (okLegacy ? 'OK   ' : 'FAIL ') + '音色不在列表里：回落到「自定义」并回填原 ID');
+
+    // 5) 已从「模型 API」分区里拆干净，不能两处都渲染同一批 id
+    const apiHtml = String(ctx.renderApiSection(cfg));
+    const okMoved = !apiHtml.includes('cfg-voice-enabled') && !apiHtml.includes('settings-voice');
+    okMoved ? pass++ : fail++;
+    console.log('  ' + (okMoved ? 'OK   ' : 'FAIL ') + '「模型 API」分区里已无语音控件（id 不会重复）');
+
+    vm.runInContext("state.settingsSection = 'api';", ctx);
+  } catch (e) {
+    fail++;
+    console.log('  FAIL 语音分区抛错: ' + (e && e.message));
   }
 
   // 滑条换算函数

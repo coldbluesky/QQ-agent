@@ -39,6 +39,44 @@ export const DEFAULT_CONFIG = {
     // 改动只存在这里，不会回写内置价格表（src/model-prices.js）。
     modelPrices: {}
   },
+  // 语音输出（TTS）。两种服务类型，由 type 切换：
+  //   openai  = OpenAI 兼容的 POST {baseUrl}/audio/speech（官方 / 硅基流动 / Groq / 中转站…）
+  //   tencent = 腾讯云语音合成 TextToVoice（TC3-HMAC-SHA256 签名，音频以 base64 返回）
+  // 开启后模型才会拿到 send_voice 工具（见 orchestrator 的工具过滤）。
+  voice: {
+    enabled: false,          // 关 = 移除 send_voice 工具，模型完全不知道有语音这回事
+    type: 'openai',          // 'openai' | 'tencent'
+    // ── OpenAI 兼容模式 ──
+    provider: '',            // 复用「模型目录」里的提供商 id；留空则退回聊天模型的地址与 Key
+    baseUrl: '',             // 留空 = 用 provider 的地址，再退回 api.baseUrl
+    apiKey: '',              // 留空 = 用 provider 的 Key，再退回当前聊天模型的 Key
+    model: '',               // 语音模型 id，如 gpt-4o-mini-tts / tts-1（必填才会启用）
+    voice: 'alloy',          // 音色名（各厂商取值不同）
+    instructions: '',        // 可选：风格指令（gpt-4o-mini-tts 这类模型支持）
+    // ── 两种模式共用 ──
+    format: 'mp3',           // 输出格式：mp3 | opus | aac | flac | wav | pcm（腾讯云只支持 mp3/wav/pcm）
+    speed: 1,                // 语速倍率，1 = 原速（腾讯云模式下会折算成其 [-2,6] 的 Speed 值，有效范围 0.6x~2.5x）
+    maxChars: 200,           // 单条语音最长字符数，超出截断（防止模型念长文）
+    timeoutMs: 60000,
+    keepFiles: 100,          // data/voice/ 本地语音文件保留个数；**0 = 不限制**
+    // ── 腾讯云语音合成（type='tencent' 时生效）──
+    tencent: {
+      secretId: '',          // 访问密钥 SecretId（建议用子账号）
+      secretKey: '',         // 访问密钥 SecretKey
+      region: 'ap-guangzhou',
+      // 音色 ID。默认取「超自然大模型音色」里的聊天女声（603007 邻家女孩）——
+      // 自然度远高于 101001（智瑜）那批精品音色，后者是标准 TTS 腔。
+      // 完整列表见腾讯云《音色列表》：超自然大模型音色 > 大模型音色 > 精品音色。
+      voiceType: 603007,
+      // 采样率：8000 | 16000 | 24000。⚠️ 24000 只有超自然/大模型音色支持，
+      // 精品音色（10xxxx）最高 16k，配错会报 InvalidParameterValue.SampleRate。
+      sampleRate: 24000,
+      volume: 0,             // 音量，范围 [-10, 10]，0 = 正常
+      modelType: 1,          // 模型类型，1 = 默认模型
+      primaryLanguage: 1,    // 主语言：1 中文 | 2 英文
+      endpoint: ''           // 留空 = https://tts.tencentcloudapi.com（一般不用改）
+    }
+  },
   // 多提供商模型目录（设置页手动维护）
   providers: [],
   // 多提供商模型目录（设置页手动维护）

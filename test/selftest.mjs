@@ -1237,13 +1237,19 @@ refs:
     // 后端权威派生：只传滑条位置，后端应算出档位与概率
     const { updateConfig } = await import('../src/config.js');
     const fs2 = await import('node:fs');
-    const backup = fs2.readFileSync('data/config.json', 'utf8');
+    // ⚠️ 必须读写本次测试自己的临时数据目录。
+    // 这里曾经写死相对路径 'data/config.json'，那指向的是**项目根目录下的用户数据目录**：
+    // 在干净的检出一跑就 ENOENT 失败，更糟的是在开发机上会把真实配置备份又覆盖回去。
+    // updateConfig 落盘的目标本来就是 QQ_AGENT_DATA_DIR（=dataDir），两者必须一致。
+    const cfgPath = path.join(dataDir, 'config.json');
+    const hadCfg = fs2.existsSync(cfgPath);
+    const backup = hadCfg ? fs2.readFileSync(cfgPath, 'utf8') : null;
     try {
       const n = updateConfig({ store: { contextSliderPos: 55 } });
       assert.equal(n.store.contextTier, 3, '后端应把 55% 派生为 3 档');
       assert.ok(Math.abs(n.store.randomPercent - 50) < 1, '后端应把 55% 派生为 50% 概率');
     } finally {
-      fs2.writeFileSync('data/config.json', backup, 'utf8');
+      if (hadCfg) fs2.writeFileSync(cfgPath, backup, 'utf8');
     }
     pass('响应档位滑条：分区 + 概率线性 + 后端权威派生');
   }

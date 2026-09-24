@@ -16,15 +16,17 @@ import { chatCompletion, chatCompletionWithRetry, addUsage, isRetryableError } f
 import { buildToolDefs, toOpenAiTools, executeTool } from './tools.js';
 import { modelImageVerdict } from './vision-scan.js';
 import { currentProviders } from './providers.js';
+import { voiceReady } from './tts.js';
 
 export class Orchestrator {
-  constructor({ store, memory, stickers, sender, sessions, onebot, emit = null }) {
+  constructor({ store, memory, stickers, sender, sessions, onebot, tts = null, emit = null }) {
     this.store = store;
     this.memory = memory;
     this.stickers = stickers;
     this.sender = sender;
     this.sessions = sessions;
     this.onebot = onebot;
+    this.tts = tts;                    // 语音合成器；null = 未启用语音
     this.emit = typeof emit === 'function' ? emit : ((b) => b.emit.bind(b))(createEventBus());
     this.toolDefs = buildToolDefs();
 
@@ -465,9 +467,14 @@ export class Orchestrator {
     const visionEnabled = cfg.api.vision !== false
       && modelImageVerdict(cfg.api.provider, cfg.api.model) !== 'no-vision';
     const searchEnabled = cfg.webSearch?.enabled !== false;
+    // 语音：开关打开、真的注入了合成器、且配置完整（选好模型/凭证）才给工具。
+    // 少了任一条件都不注册 —— 否则模型每次调用都撞一个必然失败的报错，白烧 token；
+    // 缺什么设置页已经明确提示了。
+    const voiceEnabled = cfg.voice?.enabled === true && Boolean(this.tts) && voiceReady().ok;
     const toolDefs = this.toolDefs.filter((d) => {
       if (!visionEnabled && (d.name === 'get_message_images' || d.name === 'get_sticker_image')) return false;
       if (!searchEnabled && (d.name === 'web_search' || d.name === 'web_fetch')) return false;
+      if (!voiceEnabled && d.name === 'send_voice') return false;
       return true;
     });
     const openAiTools = toOpenAiTools(toolDefs);
@@ -482,6 +489,7 @@ export class Orchestrator {
       memory: this.memory,
       stickers: this.stickers,
       sender: this.sender,
+      tts: voiceEnabled ? this.tts : null,
       session,
       emit: (type, payload) => this.emit(type, payload)
     };

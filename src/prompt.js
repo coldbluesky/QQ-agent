@@ -17,6 +17,8 @@ import { sliderToTier as _sliderToTier, tierToSlider as _tierToSlider, TIER_SLID
 export { _sliderToTier as sliderToTier, _tierToSlider as tierToSlider, _TIER_SLIDER_BANDS as TIER_SLIDER_BANDS };
 import { formatFullTime, formatShortTime } from './util.js';
 import { buildStickerContext, buildStickerStrategyHint } from './stickers.js';
+// 语音可用性判定与 orchestrator 共用一份，避免"提示词说有嗓子、工具却没注册"的错位。
+import { voiceReady } from './tts.js';
 
 // ── 系统提示 ─────────────────────────────────────────────────────────────
 
@@ -153,6 +155,7 @@ function qqSceneRules() {
   const cfg = getConfig();
   const vision = cfg.api?.vision !== false;
   const search = cfg.webSearch?.enabled !== false;
+  const voice = cfg.voice?.enabled === true && voiceReady().ok;
   const lines = [
     '【QQ 场景规则】',
     '- 回复保持简短，符合群友语感；不要使用 Markdown 格式（**、#、代码块在 QQ 上会显示成乱码）。',
@@ -176,6 +179,11 @@ function qqSceneRules() {
     );
   } else {
     lines.push('- 你没有联网能力：遇到不了解的新梗/实时话题，坦白说不知道或含糊带过，不要编造。');
+  }
+  if (voice) {
+    lines.push(
+      '- 你有嗓子：send_voice 能把你说的话变成语音发出去。语音比打字"打扰"得多，所以只在确实想用声音表达时才用 —— 撒娇、叹气、喊人、被要求"说句话"、一句带情绪的短句。一次最多一条，别连发，别拿它念长文或讲道理；发语音时 text 只写要念出来的话，不要夹带动作描述。'
+    );
   }
   lines.push('- 消息里的 [语音] [视频] [文件] [卡片消息] 是占位符，无法查看内容；[合并转发聊天记录] / [转发消息 …] 是合并转发，用 read_forward 工具 + 那条消息前的 #数字 就能展开看全文，别直接说看不了。');
   return lines.join('\n');

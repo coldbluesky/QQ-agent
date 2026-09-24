@@ -155,7 +155,11 @@ export class OneBotClient {
     return this.call(action, params);
   }
 
-  async sendText(kind, id, text, { replyToMessageId = null, atUserId = null } = {}) {
+  /**
+   * 构造 reply / at 前缀段。三种发送（文字/表情/语音）共用，避免校验逻辑各写一份
+   * （历史上 sendText 和 sendSticker 的报错文案就已经不一致了）。
+   */
+  #head({ replyToMessageId = null, atUserId = null } = {}) {
     const segments = [];
     if (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '') {
       const rid = String(replyToMessageId).trim();
@@ -167,23 +171,37 @@ export class OneBotClient {
       if (!/^\d+$/.test(at)) throw new Error('atUserId 必须是正整数 QQ 号，且不能为 all');
       segments.push({ type: 'at', data: { qq: at } });
     }
-    segments.push({ type: 'text', data: { text: escapeCqText(String(text ?? '')) } });
+    return segments;
+  }
+
+  async sendText(kind, id, text, options = {}) {
+    const segments = [...this.#head(options), { type: 'text', data: { text: escapeCqText(String(text ?? '')) } }];
     return this.sendSegments(kind, id, segments);
   }
 
-  async sendSticker(kind, id, imageUrl, { replyToMessageId = null, atUserId = null } = {}) {
-    const segments = [];
-    if (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '') {
-      const rid = String(replyToMessageId).trim();
-      if (!/^-?[1-9]\d*$/.test(rid)) throw new Error('replyToMessageId 必须是非零整数');
-      segments.push({ type: 'reply', data: { id: rid } });
-    }
-    if (atUserId !== undefined && atUserId !== null && String(atUserId).trim() !== '') {
-      const at = String(atUserId).trim();
-      if (!/^\d+$/.test(at)) throw new Error('atUserId 必须是正整数 QQ 号，且不能为 all');
-      segments.push({ type: 'at', data: { qq: at } });
-    }
-    segments.push({ type: 'image', data: { file: String(imageUrl) } });
+  async sendSticker(kind, id, imageUrl, options = {}) {
+    const segments = [...this.#head(options), { type: 'image', data: { file: String(imageUrl) } }];
+    return this.sendSegments(kind, id, segments);
+  }
+
+  /**
+   * 发送语音（OneBot record 段）。
+   *
+   * file 支持三种形态，但本项目只产出本地绝对路径（见 tts.js）——那是最稳的一种：
+   *   - 本地绝对路径：D:/.../data/voice/xxx.mp3（这里会统一成正斜杠，Windows 反斜杠
+   *     在部分协议端会被当成转义符吃掉）
+   *   - http(s) URL
+   *   - base64://...
+   *
+   * 注：QQ 原生要求 silk，SnowLuma/NapCat 在有 ffmpeg 时会自动把 mp3 转码；
+   * 转不了就会发出去放不响，此时把 voice.format 换成 opus/wav 再试。
+   */
+  async sendRecord(kind, id, file, options = {}) {
+    const target = String(file ?? '').trim();
+    if (!target) throw new Error('语音文件不能为空');
+    // 只对本地路径做斜杠归一化；URL / base64 原样透传
+    const normalized = /^(https?:|base64:|file:)/i.test(target) ? target : target.replace(/\\/g, '/');
+    const segments = [...this.#head(options), { type: 'record', data: { file: normalized } }];
     return this.sendSegments(kind, id, segments);
   }
 

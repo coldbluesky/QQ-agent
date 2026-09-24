@@ -134,6 +134,31 @@ export class SendQueue {
     });
   }
 
+  /**
+   * 发送一条语音（独立气泡）。
+   * voice: { file, text } —— file 是已经合成好的音频绝对路径（合成由 tts.js 负责，
+   * 这里只做发送，合成失败由调用方处理，避免把"没声音"当成"发送失败"）。
+   */
+  sendVoice(chatKey, voice, options = {}) {
+    const [kind, id] = String(chatKey).split(':');
+    const chain = this.#chain(chatKey);
+    const spoken = String(voice?.text ?? '').slice(0, 200);
+    return chain(async () => {
+      this.#checkRate(chatKey);
+      await sleep(randInt(800, 1600));   // 语音比文字更"重"，真人式的停顿给足
+      const data = await this.onebot.sendRecord(kind, id, voice?.file, {
+        replyToMessageId: options.replyToMessageId ?? null,
+        atUserId: options.atUserId ?? null
+      });
+      const ts = Date.now();
+      // 留档格式与"收到语音"的占位符保持一致（都是 [语音] 开头），
+      // 这样下次运行翻记录时，模型看得出自己发过语音、也看得出说了什么。
+      this.store.appendSelf(chatKey, { text: spoken ? `[语音] ${spoken}` : '[语音]', ts, mid: data?.message_id ?? null });
+      this.onSent?.({ chatKey, text: `[语音] ${spoken.slice(0, 40)}`, messageId: data?.message_id ?? null, voice: true });
+      return { message_id: data?.message_id ?? null, spoken, at: formatClockTime(ts) };
+    });
+  }
+
   /** 拍一拍。发送成功后留档（self 记录），否则下一次运行不知道自己拍过。 */
   poke(chatKey, targetUserId) {
     const [kind, id] = String(chatKey).split(':');

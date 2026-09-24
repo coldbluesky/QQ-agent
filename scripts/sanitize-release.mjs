@@ -111,6 +111,16 @@ function resetConfig() {
     }
   }
 
+  // ── 语音输出（TTS）──
+  if (cfg.voice) {
+    for (const k of ['apiKey', 'baseUrl', 'model', 'provider', 'instructions']) set(cfg.voice, k, '');
+    if ('enabled' in cfg.voice) cfg.voice.enabled = false;
+    // 腾讯云模式：两个凭据都要清（secretId/secretKey 含 "secret"，也会被扫描器命中）
+    if (cfg.voice.tencent) {
+      for (const k of ['secretId', 'secretKey', 'endpoint']) set(cfg.voice.tencent, k, '');
+    }
+  }
+
   // ── SnowLuma 令牌 / 密码 ──
   if (cfg.snowluma) {
     for (const k of ['accessToken', 'httpAccessToken', 'webuiPassword', 'dir']) {
@@ -207,6 +217,7 @@ if (!SCAN_ONLY) {
   rmrf('sessions', '会话留档');
   rmrf('memory', '记忆');
   rmrf('stickers.json', '表情库');
+  rmrf('voice', '语音缓存');
   rmrf('usage-today.json', '今日用量');
   rmrf('feedbacks.json', '反馈记录');
   rmrf('price-feed-cache.json', '远程价格表缓存');
