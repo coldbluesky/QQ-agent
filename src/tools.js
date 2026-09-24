@@ -6,6 +6,7 @@
 import { getConfig } from './config.js';
 import { normalizeMessageList, unquoteJsonString } from './util.js';
 import { formatStickerList } from './stickers.js';
+import { formatSongList, findSong, clipSong } from './songs.js';
 import { validateImageUrl, safeFetchBinary } from './safe-fetch.js';
 import { webSearch, webFetch } from './web-search.js';
 import { expandForwardNodes } from './onebot.js';
@@ -66,6 +67,7 @@ function imageParts(text, dataUrls) {
  *   chatKey, kind, chatId, selfId, selfNickname, botName,
  *   onebot, store, memory, stickers, sender, session,
  *   tts,  语音合成器（未启用语音时为 null —— send_voice 届时不会注册）
+ *   songs 曲库快照（空数组或未就绪时 sing / list_songs 不会注册）
  *   emit  (事件上报给 UI/日志)
  * }
  */
@@ -173,6 +175,71 @@ export function buildToolDefs() {
           });
         } catch (error) {
           return err(`发语音失败：${error?.message ?? error}`);
+        }
+      }
+    },
+    {
+      name: 'list_songs',
+      description: '看看你的曲库里有哪些歌（可按关键词搜）。被点歌、或聊天正好聊到某首歌时用。',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: '可选搜索词，匹配歌名 / 别名 / 歌手 / 标签' },
+          limit: { type: 'integer', description: '最多返回几首，默认 50' }
+        }
+      },
+      async execute(ctx, args) {
+        try {
+          const result = formatSongList(
+            ctx.songs || [],
+            String(args.query ?? ''),
+            Math.min(200, Math.max(1, Number(args.limit) || 50))
+          );
+          return ok(result);
+        } catch (error) {
+          return err(error?.message ?? error);
+        }
+      }
+    },
+    {
+      name: 'sing',
+      description: '唱一段歌：把曲库里某首歌的片段当语音消息发出去（片段只有几十秒，这是正常的，别当成没唱完）。被明确点歌、或聊天正好聊到某首歌时才唱；不要主动连唱，也不要用唱歌回应每句话。song 填歌名或关键词，不确定有什么歌就先 list_songs。',
+      parameters: {
+        type: 'object',
+        properties: {
+          song: { type: 'string', description: '要唱哪首歌（歌名或关键词，可先 list_songs 查）' },
+          start: { type: 'number', description: '可选：从第几秒开始唱。默认从这首歌最抓耳的一段开始，一般不用填' }
+        },
+        required: ['song']
+      },
+      async execute(ctx, args) {
+        try {
+          if (!Array.isArray(ctx.songs) || !ctx.songs.length) {
+            return err('曲库是空的。需要先把歌放进 data/songs/ 并写好 manifest.json，再在设置里开启唱歌功能');
+          }
+          const want = String(args.song ?? '').trim();
+          if (!want) return err('要唱哪首歌？可以先用 list_songs 看看曲库');
+          const song = findSong(ctx.songs, want);
+          if (!song) {
+            const titles = ctx.songs.slice(0, 8).map((s) => s.title).join('、');
+            return err(`曲库里没有「${want}」。现有的是：${titles}${ctx.songs.length > 8 ? ' 等' : ''}（可用 list_songs 看全部）`);
+          }
+          const startArg = Number(args.start);
+          const clip = await clipSong(song, {
+            start: Number.isFinite(startArg) && startArg >= 0 ? startArg : null,
+            maxSeconds: Math.max(5, Number(getConfig().song?.maxSeconds) || 30)
+          });
+          const result = await ctx.sender.sendSong(ctx.chatKey, { file: clip.file, title: song.title });
+          ctx.session.sent.push({ type: 'voice', text: `[唱歌] ${song.title}`, at: result.at });
+          ctx.emit('session-update', ctx.session.id);
+          return ok({
+            sung: song.title,
+            from: clip.startSec,
+            durationSec: clip.durationSec,
+            note: '已经唱出去了。不要输出"已发送/我唱了"这类汇报，继续下一步或直接结束。'
+          });
+        } catch (error) {
+          return err(`唱歌失败：${error?.message ?? error}`);
         }
       }
     },

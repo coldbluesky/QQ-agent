@@ -474,8 +474,11 @@ export function voiceFileParam(filePath) {
   return local.startsWith('/') ? `file://${local}` : `file:///${local}`;
 }
 
-/** 按保留个数清理旧语音文件（keepFiles<=0 表示不限制，直接跳过）。 */
-function pruneVoiceFiles(keepRaw) {
+/**
+ * 按保留个数清理旧语音文件（keepFiles<=0 表示不限制，直接跳过）。
+ * 导出给 songs.js 复用：歌曲片段也落在 data/voice/，共用同一套清理策略。
+ */
+export function pruneVoiceFiles(keepRaw) {
   const keep = Number(keepRaw);
   const limit = Number.isFinite(keep) && keep > 0 ? Math.floor(keep) : 0;
   if (!limit) return;

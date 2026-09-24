@@ -137,28 +137,38 @@ export class SendQueue {
   }
 
   /**
-   * 发送一条语音（独立气泡）。
-   * voice: { file, text } —— file 是已经合成好的音频绝对路径（合成由 tts.js 负责，
-   * 这里只做发送，合成失败由调用方处理，避免把"没声音"当成"发送失败"）。
+   * 发送一条音频（独立气泡）。
+   *
+   * voice: { file, text, label }
+   *   file  已经准备好的音频绝对路径。TTS 合成（tts.js）与歌曲切片（songs.js）都走这里，
+   *         合成/切片失败由调用方处理，避免把"没声音"当成"发送失败"。
+   *   text  说话内容 / 歌名，用于留档与日志
+   *   label 留档前缀，默认 '[语音]'；唱歌传 '[唱歌]'
    */
   sendVoice(chatKey, voice, options = {}) {
     const [kind, id] = String(chatKey).split(':');
     const chain = this.#chain(chatKey);
     const spoken = String(voice?.text ?? '').slice(0, 200);
+    const label = String(voice?.label || '[语音]').slice(0, 20);
     return chain(async () => {
       this.#checkRate(chatKey);
-      await sleep(randInt(800, 1600));   // 语音比文字更"重"，真人式的停顿给足
+      await sleep(randInt(800, 1600));   // 音频比文字更"重"，真人式的停顿给足
       const data = await this.onebot.sendRecord(kind, id, voiceFileParam(voice?.file), {
         replyToMessageId: options.replyToMessageId ?? null,
         atUserId: options.atUserId ?? null
       });
       const ts = Date.now();
-      // 留档格式与"收到语音"的占位符保持一致（都是 [语音] 开头），
-      // 这样下次运行翻记录时，模型看得出自己发过语音、也看得出说了什么。
-      this.store.appendSelf(chatKey, { text: spoken ? `[语音] ${spoken}` : '[语音]', ts, mid: data?.message_id ?? null });
-      this.onSent?.({ chatKey, text: `[语音] ${spoken.slice(0, 40)}`, messageId: data?.message_id ?? null, voice: true });
+      // 留档以 [语音] / [唱歌] 开头，与"收到语音"的占位符同款，
+      // 这样下次运行翻记录时，模型看得出自己发过音频、也看得出说的/唱的是什么。
+      this.store.appendSelf(chatKey, { text: spoken ? `${label} ${spoken}` : label, ts, mid: data?.message_id ?? null });
+      this.onSent?.({ chatKey, text: `${label} ${spoken.slice(0, 40)}`, messageId: data?.message_id ?? null, voice: true });
       return { message_id: data?.message_id ?? null, spoken, at: formatClockTime(ts) };
     });
+  }
+
+  /** 唱一段歌：完全复用语音发送链路，只把留档前缀换成 [唱歌]。 */
+  sendSong(chatKey, { file, title }, options = {}) {
+    return this.sendVoice(chatKey, { file, text: String(title ?? ''), label: '[唱歌]' }, options);
   }
 
   /** 拍一拍。发送成功后留档（self 记录），否则下一次运行不知道自己拍过。 */

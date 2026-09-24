@@ -17,6 +17,7 @@ import { buildToolDefs, toOpenAiTools, executeTool } from './tools.js';
 import { modelImageVerdict } from './vision-scan.js';
 import { currentProviders } from './providers.js';
 import { voiceReady } from './tts.js';
+import { loadSongLibrary, songsStatus } from './songs.js';
 
 export class Orchestrator {
   constructor({ store, memory, stickers, sender, sessions, onebot, tts = null, emit = null }) {
@@ -416,6 +417,9 @@ export class Orchestrator {
       try { stickerEntries = (await this.stickers.sync(false)).entries ?? []; } catch { stickerEntries = []; }
     }
 
+    // 曲库快照（提示词 + 工具用）。纯本地清单，读一次即可，不需要网络。
+    const songEntries = loadSongLibrary();
+
     // 组装提示词（无 LLM 历史）
     const systemPrompt = buildSystemPrompt();
     const userPrompt = buildUserPrompt({
@@ -424,6 +428,7 @@ export class Orchestrator {
       store: this.store,
       memory: this.memory,
       stickerEntries,
+      songEntries,
       selfNickname,
       selfLastMessageAt,
       lastMessageAt,
@@ -471,10 +476,15 @@ export class Orchestrator {
     // 少了任一条件都不注册 —— 否则模型每次调用都撞一个必然失败的报错，白烧 token；
     // 缺什么设置页已经明确提示了。
     const voiceEnabled = cfg.voice?.enabled === true && Boolean(this.tts) && voiceReady().ok;
+    // 曲库：开关 + 有歌 + 装了 ffmpeg 三者齐备才注册 sing / list_songs。
+    // 缺 ffmpeg 是最容易踩的（它是个系统依赖），这里判掉能让模型完全不知道有唱歌这回事，
+    // 而不是每次调用都撞一条"未安装 ffmpeg"。缺什么设置页会显示。
+    const songState = songsStatus(songEntries);
     const toolDefs = this.toolDefs.filter((d) => {
       if (!visionEnabled && (d.name === 'get_message_images' || d.name === 'get_sticker_image')) return false;
       if (!searchEnabled && (d.name === 'web_search' || d.name === 'web_fetch')) return false;
       if (!voiceEnabled && d.name === 'send_voice') return false;
+      if (!songState.ok && (d.name === 'sing' || d.name === 'list_songs')) return false;
       return true;
     });
     const openAiTools = toOpenAiTools(toolDefs);
@@ -490,6 +500,7 @@ export class Orchestrator {
       stickers: this.stickers,
       sender: this.sender,
       tts: voiceEnabled ? this.tts : null,
+      songs: songState.ok ? songEntries : [],
       session,
       emit: (type, payload) => this.emit(type, payload)
     };

@@ -1427,6 +1427,72 @@ refs:
     pass('read_forward 工具：按需展开 + 写回存档 + 二次读缓存 + 错误提示');
   }
 
+  // ── 场景：曲库（唱歌）纯逻辑 ──
+  // 切片本身要 ffmpeg，不在这里跑；这里锁的是「找准歌」和「切哪一段」——
+  // 后者踩过一次坑：resolveClipPlan 用 Number(null) 判空，0 是有限数，
+  // 导致"没指定起点"被当成"从 0 秒开始"，人工标好的 chorusAt 永远不生效。
+  {
+    const songs = await import('../src/songs.js');
+    const songsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-agent-songs-'));
+    const manifestFile = path.join(songsDir, 'manifest.json');
+    fs.writeFileSync(path.join(songsDir, 'a.mp3'), 'fake-audio');
+    fs.writeFileSync(manifestFile, JSON.stringify([
+      { file: 'a.mp3', title: '测试歌', artist: '某歌手', aliases: ['别名歌'], chorusAt: 45, seconds: 12, tags: ['经典'] },
+      { file: 'missing.mp3', title: '幽灵歌' },        // 文件不存在 → 丢弃
+      { file: '../逃逸.mp3', title: '越权歌' },         // 路径穿越 → 拒绝
+      { title: '没有文件名' }                          // 缺 file → 丢弃
+    ]), 'utf8');
+
+    const lib = songs.loadSongLibrary({ songsDir, manifestFile });
+    assert.strictEqual(lib.length, 1, `只应收录 1 首可用的，实际 ${lib.length}`);
+    assert.strictEqual(lib[0].chorusAt, 45);
+
+    // 二次读取走缓存，且换目录不会命中上一个目录的结果（缓存键含清单路径）
+    assert.strictEqual(songs.loadSongLibrary({ songsDir, manifestFile })[0].title, '测试歌');
+    const emptyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-agent-songs2-'));
+    assert.strictEqual(songs.loadSongLibrary({ songsDir: emptyDir, manifestFile: path.join(emptyDir, 'manifest.json') }).length, 0,
+      '换一个目录读应返回空库，而不是上一个目录的缓存');
+    fs.rmSync(emptyDir, { recursive: true, force: true });
+
+    // 点歌匹配：歌名 / 别名 / 歌手 / 标签
+    assert.strictEqual(songs.findSong(lib, '测试歌').title, '测试歌');
+    assert.strictEqual(songs.findSong(lib, '别名歌').title, '测试歌');
+    assert.strictEqual(songs.findSong(lib, '某歌手').title, '测试歌');
+    assert.strictEqual(songs.findSong(lib, '经典').title, '测试歌');
+    assert.strictEqual(songs.findSong(lib, '没有这首'), null);
+
+    // 切片规划
+    const plan = songs.resolveClipPlan(lib[0], { maxSeconds: 30 });
+    assert.strictEqual(plan.startSec, 45, '未指定起点时应落到人工标注的 chorusAt（不是 0）');
+    assert.strictEqual(plan.durationSec, 12, '清单里的 seconds 应优先于全局 maxSeconds');
+    assert.strictEqual(songs.resolveClipPlan(lib[0], { start: 10, maxSeconds: 30 }).startSec, 10, '显式 start 覆盖 chorusAt');
+    assert.strictEqual(songs.resolveClipPlan({ chorusAt: 0, seconds: 0 }, { maxSeconds: 300 }).durationSec, 60, '时长应被 60 秒硬上限钳住');
+    assert.strictEqual(songs.resolveClipPlan({}, { maxSeconds: 1 }).durationSec, 5, '时长下限 5 秒');
+
+    // 提示词摘要
+    const ctxText = songs.buildSongContext(lib, 10);
+    assert.ok(ctxText.includes('测试歌') && ctxText.includes('某歌手') && ctxText.includes('别名歌'), '歌单摘要应含歌名/歌手/别名');
+
+    // 没有清单：按文件名收录（"丢一首歌进去就能试"，不用先学写清单）
+    const bareDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-agent-songs3-'));
+    fs.writeFileSync(path.join(bareDir, '赤裸裸.mp3'), 'x');
+    fs.writeFileSync(path.join(bareDir, '说明.txt'), 'x');   // 非音频应被忽略
+    const bareManifest = path.join(bareDir, 'manifest.json');
+    const bare = songs.loadSongLibrary({ songsDir: bareDir, manifestFile: bareManifest });
+    assert.strictEqual(bare.length, 1, `无清单时应扫描出 1 首音频，实际 ${bare.length}`);
+    assert.strictEqual(bare[0].title, '赤裸裸', '无清单时用文件名当歌名');
+    assert.strictEqual(bare[0].chorusAt, null, '无清单时没有副歌起点');
+
+    // 清单 JSON 写坏：退回扫描目录，而不是让整个曲库变空
+    fs.writeFileSync(bareManifest, '{ 这不是合法 JSON', 'utf8');
+    assert.strictEqual(songs.loadSongLibrary({ songsDir: bareDir, manifestFile: bareManifest }).length, 1,
+      '清单坏掉时应退回扫描，而不是变空库');
+    fs.rmSync(bareDir, { recursive: true, force: true });
+
+    fs.rmSync(songsDir, { recursive: true, force: true });
+    pass('曲库：清单容错 + 无清单扫描回退 + 找歌 + 切片规划（chorusAt 生效）+ 歌单摘要');
+  }
+
   // ── 收尾 ──
   await app.stop();
   onebotWs.close();

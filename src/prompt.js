@@ -19,6 +19,7 @@ import { formatFullTime, formatShortTime } from './util.js';
 import { buildStickerContext, buildStickerStrategyHint } from './stickers.js';
 // 语音可用性判定与 orchestrator 共用一份，避免"提示词说有嗓子、工具却没注册"的错位。
 import { voiceReady } from './tts.js';
+import { buildSongContext } from './songs.js';
 
 // ── 系统提示 ─────────────────────────────────────────────────────────────
 
@@ -142,6 +143,19 @@ function stickerRules() {
   ].join('\n');
 }
 
+function songRules() {
+  // 曲库没开就整段不发：宁可让模型完全不知道有唱歌这回事，
+  // 也不要在提示词里提一个它拿不到的工具。
+  if (getConfig().song?.enabled !== true) return '';
+  return [
+    '【唱歌：偶尔，别当点唱机】',
+    '- 你有曲库（见【可唱的歌】）：用 sing 能把某首歌的片段当语音消息发出去。片段只有几十秒，这是设计如此，不要解释"我只唱一段"。',
+    '- 值得唱：有人明确点歌、聊天正好聊到某首歌、气氛到了想活跃一下。',
+    '- 不值得唱：没人提音乐时硬唱；同一段对话里唱第二次；用唱歌去回应普通问题。',
+    '- 唱完就翻篇：不要追问"好听吗""还要听吗"，也不要汇报"我唱了"。'
+  ].join('\n');
+}
+
 function reportBan() {
   return [
     '【发送与汇报禁令（违反即严重违规）】',
@@ -221,6 +235,11 @@ export function buildSystemPrompt({ persona } = {}) {
     '',
     reportBan()
   ];
+  // 唱歌策略是条件段（曲库没开时 songRules 返回空串），所以单独 push 而不是塞进数组，
+  // 免得在提示词里留一串空行。
+  const songText = songRules();
+  if (songText) parts.push('', songText);
+
   if (cfg.customRules && String(cfg.customRules).trim()) {
     parts.push('', '【管理员附加规则】', String(cfg.customRules).trim());
   }
@@ -516,6 +535,12 @@ export function buildUserPrompt(ctx) {
   if (cfg.sticker?.enabled !== false) {
     const stickerCtx = buildStickerContext(ctx.stickerEntries || [], Number(cfg.sticker?.promptMaxStickers) || 10);
     if (stickerCtx) parts.push(stickerCtx);
+  }
+
+  // 曲库（目录本身）。唱歌的时机/频率引导在系统提示的【唱歌】段，这里只列歌名。
+  if (cfg.song?.enabled === true) {
+    const songCtx = buildSongContext(ctx.songEntries || [], Number(cfg.song?.promptMaxSongs) || 10);
+    if (songCtx) parts.push(songCtx);
   }
 
   // 引导说明

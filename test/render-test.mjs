@@ -180,7 +180,8 @@ try {
       'cfg-voice-voicetype', 'cfg-voice-voicetype-custom', 'cfg-voice-region',
       'cfg-voice-samplerate', 'cfg-voice-volume',
       'cfg-voice-format', 'cfg-voice-speed', 'cfg-voice-maxchars', 'cfg-voice-keepfiles',
-      'voice-test-btn', 'voice-test-audio'
+      'voice-test-btn', 'voice-test-audio',
+      'cfg-song-enabled', 'cfg-song-maxseconds', 'cfg-song-promptmax', 'song-status'
     ];
     const missing = needed.filter((id) => !tcHtml.includes(id));
     missing.length === 0 ? pass++ : fail++;

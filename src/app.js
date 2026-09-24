@@ -23,6 +23,7 @@ import { importFromDsh, currentProviders, setProviderKey, testAllProviders, test
 import { scanModelsVision, visionResults, modelImageVerdict } from './vision-scan.js';
 import { builtinVisionResults } from './model-vision-docs.js';
 import { speak, testVoice } from './tts.js';
+import { loadSongLibrary, songsStatus, SONGS_DIR } from './songs.js';
 import { createEventBus, todayKey } from './util.js';
 
 // 全局 fetch（undici）默认连接建立超时只有 10 秒，openrouter.ai 这类海外端点
@@ -1058,6 +1059,23 @@ export function createApp({ log = console.log } = {}) {
         const overrides = body?.overrides && typeof body.overrides === 'object' ? body.overrides : {};
         const result = await testVoice(text.slice(0, 100), overrides);
         return json(res, 200, { ok: true, result });
+      }
+
+      // ── 曲库状态（设置页显示：收录了几首、ffmpeg 有没有装）──
+      if (pathname === '/api/songs' && method === 'GET') {
+        const entries = loadSongLibrary();
+        return json(res, 200, {
+          ok: true,
+          dir: SONGS_DIR,
+          status: songsStatus(entries),
+          songs: entries.map((e) => ({
+            title: e.title,
+            artist: e.artist,
+            chorusAt: e.chorusAt,
+            seconds: e.seconds,
+            file: e.file
+          }))
+        });
       }
 
       // ── 自定义搜索提供商（可添加多个，交互沿用模型提供商那套）──

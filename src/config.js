@@ -206,6 +206,16 @@ export const DEFAULT_CONFIG = {
     // 强制会显得机械，引导才能让它在合适的时候自然用上。
     encourage: 1
   },
+  // 唱歌 / 曲库：把 data/songs/ 里的歌切片后当作语音消息发出去。
+  // 与语音输出（TTS）是两条独立的链路，但共用发送方式（record 段 + fileMode）。
+  song: {
+    // 默认关：它要求用户自己准备素材（data/songs/ 放歌 + 写 manifest.json）
+    // 并且装 ffmpeg，出厂就开着只会让模型拿到一个必然失败的工具。
+    enabled: false,
+    promptMaxSongs: 10,      // 提示词里列几首（其余可用 list_songs 查）
+    maxSeconds: 30,          // 单次唱多长；硬上限 60（QQ 语音普通账号的上限）
+    prompt: true             // 是否在系统提示里加【唱歌】策略段
+  },
   // 存储
   store: {
     // 单群 JSON 最大保留条数。**0 = 不限制**。

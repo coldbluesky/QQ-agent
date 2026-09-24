@@ -3010,7 +3010,27 @@ function renderVoiceSection(c) {
       <span id="voice-test-result" class="muted" style="font-size:12px"></span>
       <audio id="voice-test-audio" controls style="height:30px;display:none"></audio>
     </div>
-    <div class="hint">协议端需要支持发送 record 消息段（SnowLuma / NapCat 均可）。若发出去的声音放不响，多半是格式问题，把「音频格式」换成 wav 再试。</div>`;
+    <div class="hint">协议端需要支持发送 record 消息段（SnowLuma / NapCat 均可）。若发出去的声音放不响，多半是格式问题，把「音频格式」换成 wav 再试。</div>
+
+    <div class="settings-divider"></div>
+
+    <h3>唱歌（曲库）</h3>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-song-enabled" ${c.song?.enabled === true ? 'checked' : ''} />
+      <label for="cfg-song-enabled">允许模型唱歌（关闭则移除 sing / list_songs 工具）</label>
+      <span id="song-switch-hint" class="muted" style="font-size:12px;align-self:center"></span></div>
+
+    <div class="field-row">
+      <div class="field"><label>单次唱多长（秒）</label>
+        <input type="number" id="cfg-song-maxseconds" min="5" max="60" value="${esc(c.song?.maxSeconds ?? 30)}" />
+        <div class="hint">上限 60 —— QQ 语音消息普通账号的硬上限，超了发不出去。</div></div>
+      <div class="field"><label>提示词里列几首</label>
+        <input type="number" id="cfg-song-promptmax" min="1" max="50" value="${esc(c.song?.promptMaxSongs ?? 10)}" />
+        <div class="hint">其余的模型可以用 list_songs 查，不必全塞进提示词。</div></div>
+    </div>
+    <div class="hint" id="song-status" style="margin-top:4px">曲库状态读取中…</div>
+    <div class="hint">把歌直接丢进 <code>data/songs/</code> 就能用（歌名取文件名）。想让效果更好，再放一个 <code>manifest.json</code> 标注<b>副歌起点</b>等字段，例如：<br />
+      <code>[{ "file": "稻香.mp3", "title": "稻香", "artist": "周杰伦", "aliases": ["周杰伦那首"], "chorusAt": 45 }]</code><br />
+      切片用 <b>ffmpeg</b>，要在运行机器人的机器上装好（<code>sudo apt install -y ffmpeg</code>）——它是这个功能唯一的系统依赖，没装则工具不会注册。</div>`;
 }
 
 
@@ -4105,6 +4125,27 @@ function bindSettingsEvents(c) {
   }
   syncVoiceHint();
 
+  // ── 唱歌（曲库）状态 ──
+  // 只有当前分区渲染了这块才去查（那个接口会读清单并探测一次 ffmpeg）
+  const songStatusEl = $('#song-status');
+  if (songStatusEl) {
+    api('/api/songs').then((r) => {
+      const st = r.status || {};
+      songStatusEl.textContent = `曲库：${st.total || 0} 首 · ffmpeg：${st.ffmpeg ? '已安装' : '未安装'} · 目录 ${r.dir || 'data/songs/'}`;
+      // 「功能未开启」是我们自己的开关状态，不该当成告警常驻红字
+      const missing = (st.missing || []).filter((m) => !m.includes('功能未开启'));
+      const box = $('#cfg-song-enabled');
+      const hint = $('#song-switch-hint');
+      const sync = () => {
+        if (hint) hint.textContent = box?.checked && missing.length ? `⚠ ${missing.join('；')}` : '';
+      };
+      box?.addEventListener('change', sync);
+      sync();
+    }).catch((e) => {
+      songStatusEl.textContent = `曲库状态读取失败：${e.message}`;
+    });
+  }
+
   // 模型目录“支持图片输入/不支持图片输入”徽标开关
   function applyShowVision() {
     const show = state.config?.ui?.showVision !== false;
@@ -4884,6 +4925,15 @@ async function saveConfig({ quiet = false } = {}) {
       speed: Number(val('#cfg-voice-speed', c.voice?.speed ?? 1)) || 1,
       maxChars: Math.max(1, Number(val('#cfg-voice-maxchars', c.voice?.maxChars ?? 200)) || 200),
       keepFiles: Math.max(0, Number(val('#cfg-voice-keepfiles', c.voice?.keepFiles ?? 100)) || 0),
+      // 唱歌/曲库：跟语音输出同一个分区，一起在这里读
+      ...(document.querySelector('#cfg-song-enabled') ? {
+        song: {
+          ...(c.song || {}),
+          enabled: chk('#cfg-song-enabled', c.song?.enabled === true),
+          maxSeconds: Math.min(60, Math.max(5, Number(val('#cfg-song-maxseconds', c.song?.maxSeconds ?? 30)) || 30)),
+          promptMaxSongs: Math.min(50, Math.max(1, Number(val('#cfg-song-promptmax', c.song?.promptMaxSongs ?? 10)) || 10))
+        }
+      } : {}),
       // 密钥只在输入了新值时写；掩码/留空都表示"不改"（c.voice 里本来就没有真密钥）
       ...(enteredVoiceKey && enteredVoiceKey !== '******' ? { apiKey: enteredVoiceKey } : {}),
       tencent: {
