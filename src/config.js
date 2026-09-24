@@ -74,9 +74,12 @@ export const DEFAULT_CONFIG = {
       // 自然度远高于 101001（智瑜）那批精品音色，后者是标准 TTS 腔。
       // 完整列表见腾讯云《音色列表》：超自然大模型音色 > 大模型音色 > 精品音色。
       voiceType: 603007,
-      // 采样率：8000 | 16000 | 24000。⚠️ 24000 只有超自然/大模型音色支持，
-      // 精品音色（10xxxx）最高 16k，配错会报 InvalidParameterValue.SampleRate。
-      sampleRate: 24000,
+      // 采样率：8000 | 16000 | 24000。
+      // 默认取 16000：这是腾讯云自己的默认值，也是 QQ 语音的常规档位。
+      // 别为了"更清晰"默认上 24000 —— QQ 语音链路本身工作在 16k，24k 不会更清晰，
+      // 只会让文件更大、多一层重采样，还要求音色支持（精品音色 10xxxx 最高只到 16k，
+      // 配错会报 InvalidParameterValue.SampleRate）。
+      sampleRate: 16000,
       volume: 0,             // 音量，范围 [-10, 10]，0 = 正常
       modelType: 1,          // 模型类型，1 = 默认模型
       primaryLanguage: 1,    // 主语言：1 中文 | 2 英文

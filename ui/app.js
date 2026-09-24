@@ -2963,9 +2963,9 @@ function renderVoiceSection(c) {
       <div class="field-row">
         <div class="field"><label>采样率</label>
           <select id="cfg-voice-samplerate">
-            ${[8000, 16000, 24000].map((r) => `<option value="${r}" ${Number(c.voice?.tencent?.sampleRate ?? 24000) === r ? 'selected' : ''}>${r} Hz</option>`).join('')}
+            ${[8000, 16000, 24000].map((r) => `<option value="${r}" ${Number(c.voice?.tencent?.sampleRate ?? 16000) === r ? 'selected' : ''}>${r} Hz</option>`).join('')}
           </select>
-          <div class="hint">24k 更清晰，但只有超自然/大模型音色支持；精品音色（10xxxx）最高 16k，配错会报错。</div></div>
+          <div class="hint">建议 16000（腾讯云默认值，也是 QQ 语音的常规档位）。24k 只有超自然/大模型音色支持，且不会更清晰；精品音色（10xxxx）最高 16k，配错会报错。</div></div>
         <div class="field"><label>音量（-10 ~ 10）</label>
           <input type="number" id="cfg-voice-volume" min="-10" max="10" step="1" value="${esc(c.voice?.tencent?.volume ?? 0)}" /></div>
         <div class="field"><label>主语言</label>
@@ -4016,9 +4016,11 @@ function bindSettingsEvents(c) {
     if (fmt && isTencent && !['mp3', 'wav', 'pcm'].includes(fmt.value)) fmt.value = 'mp3';
     const fmtHint = $('#voice-format-hint');
     if (fmtHint) {
+      // 协议端最终要把音频转成 silk 才能发出去。silk 编码器原生只吃 WAV/PCM，
+      // mp3 必须先过 ffmpeg 解码 —— 所以「语音转换失败」时优先换 wav。
       fmtHint.textContent = isTencent
-        ? '腾讯云只支持 mp3 / wav / pcm，选了别的会按 mp3 处理。'
-        : '发出去放不响时优先换 wav 再试。';
+        ? '腾讯云只支持 mp3 / wav / pcm，选了别的会按 mp3 处理。发不出去或报「语音转换失败」时优先换 wav：协议端的 silk 编码器原生吃 WAV/PCM，mp3 得先过 ffmpeg。'
+        : '协议端要先把音频转成 silk 才能发。wav 兼容性最好，报转换失败时优先换 wav。';
     }
     syncVoiceHint();
   };
