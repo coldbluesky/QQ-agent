@@ -516,14 +516,28 @@ export class Orchestrator {
       const msg = response.message;
       const finalContent = typeof msg.content === 'string' ? msg.content : (msg.content ?? null);
       const finalToolCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length ? msg.tool_calls : undefined;
-      const assistantEntry = {
+
+      // ⚠️ 发回上游的这条 assistant 消息必须"干净"：
+      //   1. tool_calls 要规整。这些内容会成为下一轮请求的一部分，而模型/中转网关返回
+      //      什么是我们控制不了的 —— 实测遇到过 type="functionfunction"，原样回传后
+      //      下一轮直接被上游拒：
+      //        The parameter `messages.tool_calls.type` ... invalid value: `functionfunction`
+      //   2. 不带 raw。那是我们自己的留档字段（存 usage 给用量页统计），
+      //      严格的上游会因为消息里冒出未知字段而 400。
+      // 留档仍用原始返回，两个用途就此分开。
+      const cleanToolCalls = normalizeToolCalls(msg.tool_calls);
+      const apiAssistantEntry = {
+        role: 'assistant',
+        content: finalContent,
+        ...(cleanToolCalls ? { tool_calls: cleanToolCalls } : {})
+      };
+      messages.push(apiAssistantEntry);
+      session.messages.push(structuredClone({
         role: 'assistant',
         content: finalContent,
         tool_calls: finalToolCalls,
         raw: response.raw ?? null
-      };
-      messages.push(assistantEntry);
-      session.messages.push(structuredClone(assistantEntry));
+      }));
       session.rounds = round + 1;
       markActivity('');
 
@@ -1117,6 +1131,40 @@ export class Orchestrator {
 
 function safeParse(text) {
   try { return typeof text === 'string' ? JSON.parse(text) : text; } catch { return { raw: String(text).slice(0, 500) }; }
+}
+
+/**
+ * 把模型返回的 tool_calls 规整成上游一定接受的形式。
+ *
+ * 存在的理由：我们把这些 tool_calls 原样塞进 messages 发给下一轮，而模型/中转网关
+ * 返回什么不由我们决定。实测碰到过 `type: "functionfunction"`，照抄回去后上游直接
+ * 400；也见过缺 id、arguments 是对象而非字符串、甚至整个 function 段缺失的情况。
+ * 与其把畸形数据透传给上游（报错信息还很难定位），不如在回传前统一收敛。
+ *
+ * 返回 undefined 表示"没有可用的工具调用"，调用方应省略整个 tool_calls 字段
+ * （比留一个 null/空数组更安全，部分上游对 null 也会报参数错）。
+ */
+export function normalizeToolCalls(list) {
+  if (!Array.isArray(list)) return undefined;
+  const out = [];
+  for (let i = 0; i < list.length; i++) {
+    const call = list[i];
+    if (!call || typeof call !== 'object') continue;
+    const fn = call.function && typeof call.function === 'object' ? call.function : {};
+    const name = String(fn.name ?? '').trim();
+    // 没有函数名的条目上游必然不认，直接丢弃（保留只会连累整次请求被拒）
+    if (!name) continue;
+    const rawArgs = fn.arguments;
+    const args = rawArgs === undefined || rawArgs === null
+      ? '{}'
+      : (typeof rawArgs === 'string' ? rawArgs : JSON.stringify(rawArgs));
+    out.push({
+      id: String(call.id ?? `call_${i}`),
+      type: 'function',                    // 规范里只允许这一个值
+      function: { name, arguments: args }
+    });
+  }
+  return out.length ? out : undefined;
 }
 
 // ── 内联工具调用解析（少数模型不返回原生 tool_calls，而是把调用写进文本） ──

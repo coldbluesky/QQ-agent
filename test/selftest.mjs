@@ -181,7 +181,8 @@ function createMockLLM() {
       if (scripted.toolCalls) {
         message.tool_calls = scripted.toolCalls.map((tc, i) => ({
           id: `call_${step}_${i}`,
-          type: 'function',
+          // 允许脚本显式指定畸形 type，用来验证"回传前规整"的行为
+          type: tc.type ?? 'function',
           function: { name: tc.name, arguments: JSON.stringify(tc.args ?? {}) }
         }));
       }
@@ -327,7 +328,10 @@ refs:
 
   // ── 场景 1：消息触发运行，模型用工具发言 ──
   llm.state.script.push(
-    { delayMs: 400, toolCalls: [{ name: 'send_message', args: { messages: ['在的', '咋了 [CQ:at,qq=1]'] } }] },
+    // 故意给一个畸形 type：模拟上游返回 "functionfunction"。这类值原样回传会被
+    // 上游校验拒掉（The parameter `messages.tool_calls.type` ... invalid value），
+    // 所以回传前必须由我们规整 —— 下面会断言这一点。
+    { delayMs: 400, toolCalls: [{ name: 'send_message', args: { messages: ['在的', '咋了 [CQ:at,qq=1]'] }, type: 'functionfunction' }] },
     { content: '（第一轮处理完毕）' }
   );
   pushGroupMsg(111, '张三', '在吗？', 9001);
@@ -353,6 +357,25 @@ refs:
   assert.strictEqual(send1.body.message[0].data.text, '在的');
   assert.strictEqual(send2.body.message[0].data.text, '咋了 [CQ：at,qq=1]', 'CQ 码已转义');
   pass('发送：分条 + 顺序 + CQ 转义正确');
+
+  // ── 回归：回传给上游的 assistant 消息必须是"干净"的 ──
+  // 1) tool_calls.type 只能是 'function'。上游可能返回畸形值（本轮脚本里就埋了
+  //    "functionfunction"），照抄回去下一轮会被上游校验拒绝。
+  // 2) 不能带 raw —— 那是我们自己的留档字段（存 usage 给用量页统计），
+  //    严格的上游会因消息里冒出未知字段直接 400。
+  await waitFor(() => llm.state.requests.length >= 2, 5000, '第二次 LLM 调用（带工具结果）');
+  const reqBack = llm.state.requests[1];
+  const assistantBack = reqBack.messages.find((m) => m.role === 'assistant' && m.tool_calls?.length);
+  assert.ok(assistantBack, '第二次请求里应带上带 tool_calls 的 assistant 消息');
+  assert.strictEqual(assistantBack.tool_calls[0].type, 'function',
+    `畸形 type 应被规整回 function，实际：${assistantBack.tool_calls[0].type}`);
+  assert.ok(!('raw' in assistantBack), 'assistant 消息不应带 raw 字段');
+  assert.strictEqual(
+    reqBack.messages.filter((m) => m.role === 'tool').length,
+    assistantBack.tool_calls.length,
+    '每个 tool_call 都应有一条对应的 tool 结果消息'
+  );
+  pass('回传的 assistant 消息已规整（type=function、无 raw）');
 
   assert.ok(session1.status === 'done', `运行 1 状态应为 done，实际 ${session1.status}`);
   assert.strictEqual(session1.usage.totalTokens, 250, 'usage 已累计两次调用（120+130）');
