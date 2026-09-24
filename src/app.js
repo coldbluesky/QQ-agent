@@ -490,7 +490,10 @@ export function createApp({ log = console.log } = {}) {
   }
 
   async function ingestPoke(event) {
-    // OneBot v11: notice_type=notify, sub_type=poke；群拍 target_id，私聊拍自己
+    // OneBot v11: notice_type=notify, sub_type=poke。
+    // ⚠️ 各协议端对这个事件的字段并不统一（LLOneBot 历史上就专门修过"群聊/私聊格式
+    // 不一致导致解析不出目标"）：群聊通常给 user_id(谁拍) + target_id(拍谁)，
+    // 私聊往往只有 user_id。
     const isGroup = event.group_id != null;
     const id = isGroup ? String(event.group_id) : String(event.user_id);
     const cfgNow = getConfig();
@@ -501,8 +504,27 @@ export function createApp({ log = console.log } = {}) {
     if (operatorId && operatorId === onebot.selfId) return;
     // 屏蔽名单对拍一拍同样生效（操作者是被屏蔽群员则丢弃）
     if (isGroup && operatorId && (cfgNow.blocklist?.[id] || []).map(String).includes(operatorId)) return;
-    const targetId = String(event.target_id ?? event.user_id ?? '');
-    const selfId = onebot.selfId;
+
+    // ⚠️ target_id 只能用事件里的那个值，【绝不能】回退成 event.user_id：
+    //    那样 target 就等于操作者，"谁拍了谁"的判断必然成立，
+    //    于是任何一次拍一拍都被记成「XXX 拍了拍自己」——实测就是这么错的。
+    const rawTarget = event.target_id;
+    const hasTarget = rawTarget !== undefined && rawTarget !== null && String(rawTarget).trim() !== '';
+    const targetId = hasTarget ? String(rawTarget).trim() : '';
+    const selfId = String(onebot.selfId ?? '');
+
+    // 拍的是不是机器人自己？三态：
+    //   true  = 确认拍的是机器人
+    //   false = 确认拍的是别人
+    //   null  = 判断不了（群聊但协议端没给 target_id）
+    // 私聊只有"对方↔机器人"两方，拍一拍必然是拍机器人 —— 即使看不到 target_id 也能确定。
+    const pokedSelf = isGroup ? (hasTarget ? targetId === selfId : null) : true;
+    if (pokedSelf === null) {
+      // 只在"群聊缺 target_id"这一种情形留痕：这是唯一无法判断目标的情况，
+      // 记下原始字段，下次再遇到就能直接确认协议端到底发了什么，不用再猜。
+      log('[ingest] 群聊拍一拍未带 target_id，无法判断目标：',
+        JSON.stringify({ group_id: event.group_id, user_id: event.user_id, keys: Object.keys(event) }));
+    }
     // 拍一拍也要记下真实群名片：原先这里硬编码"（拍一拍事件）"，
     // 会覆盖同一 QQ 在普通消息里的真实昵称 —— 记忆整理时取名字会拿到这个占位符，
     // 导致"317183522 的名字叫（拍一拍事件）"这种脏数据。
@@ -514,12 +536,20 @@ export function createApp({ log = console.log } = {}) {
           && String(m.senderName || '') && String(m.senderName) !== '（拍一拍事件）');
       operatorName = prior ? String(prior.senderName) : operatorId;
     }
+    // 四种情形都写成 "<某人> 拍了拍 <目标>"：措辞统一，模型不必去猜主语是谁。
+    // 原先"你拍了拍（来自 X）"这种写法在私聊里会渲染成"你拍了拍你"，很容易被读成
+    // "某人拍了自己" —— 措辞本身也是这个误报的来源之一。
     let text;
-    if (String(targetId) === String(selfId)) {
-      text = `[拍一拍] 你拍了拍${isGroup ? '' : '你'}（来自 ${operatorName}）`;
+    if (pokedSelf === true) {
+      text = `[拍一拍] ${operatorName} 拍了拍你`;
+    } else if (pokedSelf === false) {
+      const targetName = (await resolveAtName(id, targetId)) || targetId;
+      text = targetId === operatorId
+        ? `[拍一拍] ${operatorName} 拍了拍自己`
+        : `[拍一拍] ${operatorName} 拍了拍 ${targetName}`;
     } else {
-      const targetName = isGroup ? (await resolveAtName(id, targetId)) || targetId : targetId;
-      text = operatorId === targetId ? `[拍一拍] ${operatorName} 拍了拍自己` : `[拍一拍] ${operatorName} 拍了拍 ${targetName}`;
+      // 群聊且协议端没给 target_id：如实说明，绝不臆测成"拍了自己"
+      text = `[拍一拍] ${operatorName} 拍了拍某人（协议端未提供 target_id）`;
     }
     store.appendIncoming(chatKeyNow, {
       mid: null,

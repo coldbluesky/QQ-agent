@@ -604,6 +604,78 @@ refs:
   assert.strictEqual(app.store.getChatMeta('group:456').unread, 0, '回显不产生未读');
   pass('拍一拍自回环防护：自拍回显不触发 + 自拍留档');
 
+  // ── 场景 10d：拍一拍缺 target_id 时不能臆测成"拍了自己" ──
+  // 各协议端对 poke 事件的字段不统一：群聊通常给 target_id，私聊往往只有 user_id。
+  // 早期实现用 `event.target_id ?? event.user_id` 兜底 —— target 于是恒等于操作者，
+  // "谁拍了谁"的判断必然成立，任何一次拍一拍都被记成「XXX 拍了拍自己」。
+  {
+    // 按"新出现的会话"等待，避免 waitSessionDone 误配到同名的旧会话
+    const settledIds = new Set(
+      app.sessions.listSummaries(50).filter((e) => e.status !== 'running' && e.status !== 'waiting').map((e) => e.id)
+    );
+    const waitFreshSessionDone = async (label) => {
+      const found = await waitFor(() => {
+        const fresh = app.sessions.listSummaries(50)
+          .find((e) => !settledIds.has(e.id) && e.status !== 'running' && e.status !== 'waiting');
+        return fresh || null;
+      }, 9000, label);
+      settledIds.add(found.id);
+      return app.sessions.get(found.id);
+    };
+    const poke = (extra) => onebotWs.push({
+      post_type: 'notice', notice_type: 'notify', sub_type: 'poke',
+      self_id: 888, time: Math.floor(Date.now() / 1000), ...extra
+    });
+    const lastPokeText = (chatKey) => [...(app.store.recent(chatKey, { limit: 20 }) || [])]
+      .reverse().find((m) => String(m.text || '').includes('[拍一拍]'));
+
+    // (1) 私聊、无 target_id：只有"对方↔机器人"两方，必然是拍机器人
+    llm.state.script.push({ content: '（拍一下而已，不回）' });
+    poke({ user_id: 777 });
+    const privPoke = await waitFor(() => {
+      const t = lastPokeText('private:777');
+      return t && String(t.text).includes('拍了拍你') ? t : null;
+    }, 6000, '私聊拍一拍入档');
+    assert.ok(!String(privPoke.text).includes('拍了拍自己'),
+      `私聊拍一拍不能被记成"拍了自己"：${privPoke.text}`);
+    await waitFreshSessionDone('私聊拍一拍运行结束');
+
+    // (2) 群聊、无 target_id：判断不了目标，如实说明，绝不臆测
+    llm.state.script.push({ content: '（拍一下而已，不回）' });
+    poke({ group_id: 456, user_id: 114 });
+    const unknownPoke = await waitFor(() => {
+      const t = lastPokeText('group:456');
+      return t && String(t.text).includes('未提供 target_id') ? t : null;
+    }, 6000, '群聊缺 target_id 入档');
+    assert.ok(!String(unknownPoke.text).includes('拍了拍自己'),
+      `群聊缺 target_id 时不能臆测成"拍了自己"：${unknownPoke.text}`);
+    await waitFreshSessionDone('群聊缺 target_id 运行结束');
+
+    // (3) 群聊、target_id 指向机器人 → 判定为拍机器人
+    llm.state.script.push({ content: '（拍一下而已，不回）' });
+    poke({ group_id: 456, user_id: 114, target_id: 888 });
+    const mePoke = await waitFor(() => {
+      const t = lastPokeText('group:456');
+      return t && String(t.text).includes('拍了拍你') ? t : null;
+    }, 6000, '群聊点名拍机器人入档');
+    assert.ok(!String(mePoke.text).includes('拍了拍自己'), `群聊拍机器人判定错误：${mePoke.text}`);
+    await waitFreshSessionDone('群聊拍机器人运行结束');
+
+    // (4) 群聊、target_id 指向别人 → 记为拍了那个人，不是"自己"
+    llm.state.script.push({ content: '（拍一下而已，不回）' });
+    poke({ group_id: 456, user_id: 114, target_id: 113 });
+    const otherPoke = await waitFor(() => {
+      const t = lastPokeText('group:456');
+      return t && String(t.text).includes('拍了拍') && !String(t.text).includes('拍了拍你')
+        && !String(t.text).includes('target_id') ? t : null;
+    }, 6000, '群聊拍别人入档');
+    assert.ok(!String(otherPoke.text).includes('拍了拍自己'),
+      `拍别人不能被记成"拍了自己"：${otherPoke.text}`);
+    await waitFreshSessionDone('群聊拍别人运行结束');
+
+    pass('拍一拍目标判定：私聊 / 群聊缺 target_id / 群聊点名，四种情形都不误判为"拍了自己"');
+  }
+
   // ── 场景 10c：消息 id 引导（报错带可用 id）+ send_poke 参数校验 + recent 带 messageId ──
   const pokesBeforeC = onebotHttp.state.pokes.length;
   llm.state.script.push(
