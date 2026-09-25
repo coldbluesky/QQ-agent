@@ -156,6 +156,43 @@ export function createSendChain() {
   };
 }
 
+/**
+ * 本地路径 → OneBot 能识别的 file URI。**全项目唯一实现**，别再各写一份。
+ *
+ * ── 为什么必须收敛成一份（血泪教训）─────────────────────────────────
+ * 这个转换先后被抄了三处，其中 sticker-manager 那份写成了
+ * `file:///${绝对路径}`：在 POSIX 上绝对路径自带前导斜杠，拼出来是
+ * **四个斜杠**（/opt/x.gif → file:////opt/x.gif）。协议端把 pathname
+ * 解析出来就成了 //opt/x.gif，去打开它就是
+ * `send_group_msg 失败: retcode=200 ENOENT ... open '//opt/qq-agent/data/...'`。
+ * tts.js 那份额外处理了 POSIX/Windows 的差异（注释还在），但没人愿意维护两份。
+ *
+ * 规则：POSIX 的 /opt/x → file:///opt/x（三斜杠）；
+ *       Windows 的 D:/x → file:///D:/x；UNC 的 //server/share → file://server/share。
+ *
+ * 空格/中文要编码（协议端会 decodeURIComponent），`#` `?` 在 URI 里是分隔符，
+ * 必须手动转义 —— encodeURI 不处理它们。
+ */
+export function toFileUri(input) {
+  // ⚠️ 本函数刻意不使用任何正则转义（用 String.fromCharCode(92) 取反斜杠、
+  // 用 split/join 代替路径分隔符替换）。原因：这段代码最初是用脚本批量写入的，
+  // 多层转义把 `\/` 吃成了 `/`，写出了一个非法的正则字面量，
+  // 而 `node --check` 的结果被 shell 的 `&&` 链掩盖成"通过" ——
+  // 结果整个 sender.js 加载即崩，比原本要修的 bug 严重得多。
+  // 零反斜杠写法让"写错字符"这件事根本不可能发生。
+  const BS = String.fromCharCode(92);                    // 反斜杠字符本身
+  let s = String(input || '').trim().split(BS).join('/');
+  if (!s) return '';
+  if (s.slice(0, 7).toLowerCase() === 'file://') return s;   // 已是 URI → 幂等
+  const unc = s.startsWith('//');                        // UNC：\\server\share
+  // 去掉前导斜杠（逐个 split 掉，避免再用正则转义）
+  const body = unc ? s.slice(2) : s.split('/').filter(Boolean).join('/');
+  if (!body) return '';
+  // encodeURI 会处理空格/中文，但不转义 `#` `?` —— 它们在 URI 里是分隔符，必须手动转
+  const encoded = encodeURI(body).replace(/[?#]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+  return unc ? 'file://' + encoded : 'file:///' + encoded;
+}
+
 /** 简易事件总线。 */
 export function createEventBus() {
   const listeners = new Map();

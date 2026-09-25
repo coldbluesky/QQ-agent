@@ -1921,6 +1921,52 @@ refs:
     }
   }
 
+  // ── 场景 42：本地表情的 file URI 拼装 + 历史脏数据自愈 ──
+  // 回归：sticker-manager 曾手写 `file:///${绝对路径}`，POSIX 上绝对路径自带前导斜杠，
+  // 拼出来是四个斜杠；协议端解析出的路径变成 //opt/... → ENOENT
+  // （用户实测报错：send_group_msg 失败 retcode=200 open '//opt/qq-agent/data/sticker-images/…'）
+  {
+    const { toFileUri } = await import('../src/util.js');
+    const { fixFileUri } = await import('../src/stickers.js');
+    const { localStickerPath } = await import('../src/sticker-manager.js');
+
+    assert.strictEqual(
+      toFileUri('/opt/qq-agent/data/sticker-images/a.gif'),
+      'file:///opt/qq-agent/data/sticker-images/a.gif',
+      'POSIX 绝对路径应拼成三斜杠 file URI'
+    );
+    assert.strictEqual(
+      new URL('file:////opt/a.gif').pathname, '//opt/a.gif',
+      '四斜杠 URI 会被解析出双斜杠路径 —— 这正是那个 ENOENT 的来源'
+    );
+    assert.strictEqual(toFileUri('file:///opt/a.gif'), 'file:///opt/a.gif', '已是 URI 时保持幂等');
+    assert.strictEqual(toFileUri('D:\\x\\a.gif'), 'file:///D:/x/a.gif', 'Windows 路径应转成三斜杠形式');
+
+    // 老数据自愈：loadStickerStore 每条都会过 normalizeStickerEntry，所以存量的
+    // 四斜杠条目重启一次就能正常发送，不需要用户重新收藏
+    assert.strictEqual(
+      fixFileUri('file:////opt/qq-agent/data/sticker-images/a.gif'),
+      'file:///opt/qq-agent/data/sticker-images/a.gif',
+      '历史四斜杠 URI 应被修回三斜杠'
+    );
+    assert.strictEqual(fixFileUri('file://server/share/a.gif'), 'file://server/share/a.gif', 'host 形式的 file URI 不该被动');
+
+    // 受控目录判定：正常形式通过、历史四斜杠形式也要容忍、目录外仍拒绝
+    const imgDir = path.join(dataDir, 'sticker-images');
+    fs.mkdirSync(imgDir, { recursive: true });
+    const realFile = path.join(imgDir, 'collected_999.gif');
+    fs.writeFileSync(realFile, 'GIF89a');
+    const good = toFileUri(realFile);
+    assert.ok(localStickerPath(good), `正常 file URI 应通过受控目录判定：${good}`);
+    // 手工构造"多一个斜杠"的历史形式（在两种平台下都能构造出来）
+    const legacy = 'file:///' + good.slice('file://'.length);
+    assert.ok(localStickerPath(legacy), `历史四斜杠形式应被容忍，否则合法收藏图会被拒绝发送：${legacy}`);
+    const outside = path.join(dataDir, 'not-a-sticker.txt');
+    fs.writeFileSync(outside, 'x');
+    assert.strictEqual(localStickerPath(toFileUri(outside)), null, '受控目录外的本地文件必须拒绝');
+    pass('本地表情 URI：POSIX/Windows/幂等 + 历史脏数据自愈 + 受控目录判定');
+  }
+
   // ── 收尾 ──
   await app.stop();
   onebotWs.close();

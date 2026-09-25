@@ -3,43 +3,30 @@
 // - 分钟/小时限频（超限直接拒绝，工具会把错误告诉模型）
 // - Markdown → 纯文本、QQ 硬长度切分、CQ 转义
 // - 发出的每一条记进 ChatStore（self=true，供下一次运行当"自己的发言"）
+/**
+ * 本地路径 → OneBot 能识别的 file URI。
+ *
+ * 实现已搬到 util.js（零依赖，供 sticker-manager / tts 共用一份）。
+ * 这里保留 re-export 只是为了不破坏既有引用。
+ */
 import { getConfig, DEFAULT_CONFIG } from './config.js';
-import { sleep, randInt, createSendChain, escapeCqText, formatClockTime } from './util.js';
+import { sleep, randInt, createSendChain, escapeCqText, formatClockTime, toFileUri } from './util.js';
 import { mdToPlain, splitForQQ } from './md-to-plain.js';
 // 音频文件要转成协议端认识的形式（file:// URI / 裸路径 / base64）才能发
 import { voiceFileParam } from './tts.js';
+// 本地表情文件失败时要用它读文件转 base64，并复用同一套"受控目录"判定
+import fs from 'node:fs';
+import { localStickerPath } from './sticker-manager.js';
+
+export { toFileUri };
 
 // 限频回退值统一取自 DEFAULT_CONFIG，杜绝"代码默认 80 / 回退值 8 / UI 回退 8"三处打架。
 const DEFAULT_MAX_PER_MINUTE = DEFAULT_CONFIG.send.maxPerMinute;
 const DEFAULT_MAX_PER_HOUR = DEFAULT_CONFIG.send.maxPerHour;
 
-/**
- * 本地路径 → OneBot 能识别的 file URI。
- *
- * 为什么要转换而不是直接传路径：裸 Windows 路径（反斜杠 + 盘符）在 OneBot
- * 各实现里支持不一致，而 `file:///C:/a/b.png` 是规范里明确的形式。
- * 空格/中文要编码（协议端会 decodeURIComponent），`#` `?` 在 URI 里是分隔符，
- * 必须手动转义 —— encodeURI 不处理它们。
- */
-export function toFileUri(input) {
-  // ⚠️ 本函数刻意不使用任何正则转义（用 String.fromCharCode(92) 取反斜杠、
-  // 用 split/join 代替路径分隔符替换）。原因：这段代码最初是用脚本批量写入的，
-  // 多层转义把 `\/` 吃成了 `/`，写出了一个非法的正则字面量，
-  // 而 `node --check` 的结果被 shell 的 `&&` 链掩盖成"通过" ——
-  // 结果整个 sender.js 加载即崩，比原本要修的 bug 严重得多。
-  // 零反斜杠写法让"写错字符"这件事根本不可能发生。
-  const BS = String.fromCharCode(92);                    // 反斜杠字符本身
-  let s = String(input || '').trim().split(BS).join('/');
-  if (!s) return '';
-  if (s.slice(0, 7).toLowerCase() === 'file://') return s;   // 已是 URI → 幂等
-  const unc = s.startsWith('//');                        // UNC：\\server\share
-  // 去掉前导斜杠（逐个 split 掉，避免再用正则转义）
-  const body = unc ? s.slice(2) : s.split('/').filter(Boolean).join('/');
-  if (!body) return '';
-  // encodeURI 会处理空格/中文，但不转义 `#` `?` —— 它们在 URI 里是分隔符，必须手动转
-  const encoded = encodeURI(body).replace(/[?#]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
-  return unc ? 'file://' + encoded : 'file:///' + encoded;
-}
+// 本地表情文件转 base64 内联的体积上限：base64 会膨胀约 1/3，再大就走 WebSocket
+// 容易把协议端拖垮。超过就明确报错，而不是发出去卡死。
+const MAX_INLINE_STICKER_BYTES = 10 * 1024 * 1024;
 
 export class SendQueue {
   constructor({ onebot, store, onSent = null, log = null }) {
@@ -222,26 +209,48 @@ export class SendQueue {
       try {
         data = await sendVia(primary);
       } catch (firstError) {
-        // 本地文件失败没有更好的回退（get_image 认协议端缓存，本地转存没有）
-        if (primary.toLowerCase().startsWith('file:///')) throw firstError;
-        // 回退 1：get_image 按文件名/URL 拿协议端本地缓存，绕开过期直链
-        try {
-          const fileKey = sticker.md5 || sticker.resId || sticker.id || '';
-          const ret = await this.onebot.call('get_image', { file: fileKey });
-          const cached = ret?.file || ret?.filename || '';
-          if (cached) {
-            this.log?.(`[sender] 表情直链发送失败（${firstError?.message ?? firstError}），改用协议端缓存重试`);
-            data = await sendVia(cached);
+        if (primary.toLowerCase().startsWith('file:///')) {
+          // ── 本地转存文件失败 → 读本地文件、转 base64 内联重发 ──
+          // 这里以前是**直接抛错**，理由是"get_image 认协议端缓存、本地转存没有"。
+          // 那只说明了"没有更好的回退"，却漏掉了 base64 本身就是回退：
+          //   · 协议端与机器人不同机/不同容器时根本看不到这个路径
+          //     （SnowLuma 跑在 Docker 里就是这种情况）；
+          //   · 文件被清理过 / 部署目录变过 → 协议端 ENOENT。
+          // 语音那边早就为此提供了 fileMode='base64'，表情这边却没有 ——
+          // 于是"收藏完再发就报 ENOENT"变成了死路。
+          const local = localStickerPath(primary);
+          if (!local) throw firstError;
+          const buf = fs.readFileSync(local);
+          if (!buf.length) throw firstError;
+          if (buf.length > MAX_INLINE_STICKER_BYTES) {
+            throw new Error(
+              `表情本地图片 ${(buf.length / 1024 / 1024).toFixed(1)}MB，超过内联上限 `
+              + `${Math.round(MAX_INLINE_STICKER_BYTES / 1024 / 1024)}MB 无法发送；`
+              + `请确认协议端能访问 ${local}`
+            );
           }
-        } catch { /* 继续走回退 2 */ }
-        // 回退 2：下载直链转 base64 内联（此刻直链可能恰好还有效）。
-        // 上限 15MB，防超大图拖垮发送。
-        if (!data) {
-          const { safeFetchBinary } = await import('./safe-fetch.js');
-          const { buffer } = await safeFetchBinary(primary, 15 * 1024 * 1024);
-          if (!buffer?.length) throw firstError;
-          this.log?.(`[sender] 表情直链发送失败，已下载 ${Math.round(buffer.length / 1024)}KB 转 base64 发送`);
-          data = await sendVia(`base64://${buffer.toString('base64')}`);
+          this.log?.(`[sender] 表情本地文件发送失败（${firstError?.message ?? firstError}），改用 base64 内联重发`);
+          data = await sendVia(`base64://${buf.toString('base64')}`);
+        } else {
+          // 回退 1：get_image 按文件名/URL 拿协议端本地缓存，绕开过期直链
+          try {
+            const fileKey = sticker.md5 || sticker.resId || sticker.id || '';
+            const ret = await this.onebot.call('get_image', { file: fileKey });
+            const cached = ret?.file || ret?.filename || '';
+            if (cached) {
+              this.log?.(`[sender] 表情直链发送失败（${firstError?.message ?? firstError}），改用协议端缓存重试`);
+              data = await sendVia(cached);
+            }
+          } catch { /* 继续走回退 2 */ }
+          // 回退 2：下载直链转 base64 内联（此刻直链可能恰好还有效）。
+          // 上限 15MB，防超大图拖垮发送。
+          if (!data) {
+            const { safeFetchBinary } = await import('./safe-fetch.js');
+            const { buffer } = await safeFetchBinary(primary, 15 * 1024 * 1024);
+            if (!buffer?.length) throw firstError;
+            this.log?.(`[sender] 表情直链发送失败，已下载 ${Math.round(buffer.length / 1024)}KB 转 base64 发送`);
+            data = await sendVia(`base64://${buffer.toString('base64')}`);
+          }
         }
       }
       const ts = Date.now();

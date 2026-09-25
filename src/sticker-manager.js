@@ -4,6 +4,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { getConfig, DATA_DIR } from './config.js';
 import { safeFetchBinary } from './safe-fetch.js';
+// 本地路径 → file URI 的唯一实现（曾在这里手写导致 POSIX 上多一个斜杠，见 util.js 注释）
+import { toFileUri } from './util.js';
 import {
   loadStickerStore, saveStickerStore, mergeStickerLibrary,
   findSticker, formatStickerList, applyStickerNote, markStickerUsed
@@ -25,6 +27,10 @@ export function localStickerPath(raw) {
   if (!value.toLowerCase().startsWith('file:///')) return null;
   let pathname;
   try { pathname = decodeURIComponent(new URL(value).pathname); } catch { return null; }
+  // ⚠️ 历史数据可能是 file:////opt/…（四个斜杠，成因见 util.js 的 toFileUri 注释），
+  // URL 解析出来的 pathname 就是 //opt/…。先收敛前导斜杠，否则下面那句
+  // "是否落在受控目录内"会把本来合法的收藏图片误判成目录外、直接拒绝发送。
+  pathname = pathname.replace(/^\/+/, '/');
   // file:///C:/... 在 Windows URL pathname 前面多一个斜杠。
   if (/^\/[A-Za-z]:[\\/]/.test(pathname)) pathname = pathname.slice(1);
   const root = path.resolve(stickerImagesDir()) + path.sep;
@@ -215,7 +221,7 @@ export class StickerManager {
           if (buf.length) {
             const dest = path.join(imgDir, `${id}${detectImageExt(buf)}`);
             fs.writeFileSync(dest, buf);
-            return `file:///${dest.replace(/\\/g, '/')}`;
+            return toFileUri(dest);
           }
         }
         // 有的实现返回可下载 url
@@ -224,7 +230,7 @@ export class StickerManager {
           if (buf) {
             const dest = path.join(imgDir, `${id}${detectImageExt(buf)}`);
             fs.writeFileSync(dest, buf);
-            return `file:///${dest.replace(/\\/g, '/')}`;
+            return toFileUri(dest);
           }
         }
       } catch { /* 缓存没有就走下载 */ }
@@ -235,7 +241,7 @@ export class StickerManager {
       if (buf) {
         const dest = path.join(imgDir, `${id}${detectImageExt(buf)}`);
         fs.writeFileSync(dest, buf);
-        return `file:///${dest.replace(/\\/g, '/')}`;
+        return toFileUri(dest);
       }
     }
     throw new Error('图片转存失败（get_image 无缓存且 url 下载失败）');

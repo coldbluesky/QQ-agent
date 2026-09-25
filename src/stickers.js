@@ -10,6 +10,21 @@ export function nowIso() {
   return new Date().toISOString();
 }
 
+/**
+ * 修正历史数据里畸形的 file URI：`file:////opt/x` → `file:///opt/x`。
+ *
+ * 成因见 util.js 的 toFileUri 注释（手写 `file:///${绝对路径}`，POSIX 上多一个斜杠）。
+ * 放在这里做是为了**自动修好已经存下来的老数据** —— loadStickerStore 每条都会过
+ * normalizeStickerEntry，所以老库里那些发不出去的表情重启一次就能正常发了，
+ * 不需要用户重新收藏一遍。
+ *
+ * 只处理"三斜杠以上"的形式；`file://server/share`（host 形式）原样保留。
+ */
+export function fixFileUri(raw) {
+  const s = String(raw ?? '').trim();
+  return /^file:\/\/\/+/i.test(s) ? s.replace(/^file:\/\/\/+/i, 'file:///') : s;
+}
+
 export function normalizeStickerEntry(raw) {
   const entry = raw && typeof raw === 'object' ? raw : {};
   const id = String(entry.id || entry.emoji_id || entry.resId || '').trim();
@@ -20,7 +35,7 @@ export function normalizeStickerEntry(raw) {
   return {
     id,
     resId: String(entry.resId || entry.emoji_id || id).trim(),
-    url: String(entry.url || '').trim(),
+    url: fixFileUri(entry.url),
     md5: String(entry.md5 || '').trim().toUpperCase(),
     desc: String(entry.desc ?? '').trim(),
     localNote: String(entry.localNote ?? '').trim(),
