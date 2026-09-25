@@ -38,7 +38,15 @@ let cfg = () => ({});
 let log = () => {};
 
 /** 出厂默认值（与 skill.json 的 settings 保持一致，改一处要改两处）。 */
-const DEFAULTS = { narrateChars: 220, choices: 3, recapMax: 400, allowCustomTheme: true };
+const DEFAULTS = { narrateChars: 220, choices: 3, recapMax: 400, allowCustomTheme: true, showRolls: true };
+
+/**
+ * 每个叙述段最多判定几次。
+ *
+ * 为什么要封顶：判定是本技能唯一的"外部权威"，如果模型能无限重掷，骰子就形同虚设
+ * （一直掷到成功为止）。放 2 次是为了允许"攻击 + 伤害"这类成对判定，但不允许刷。
+ */
+const MAX_ROLLS_PER_SEGMENT = 2;
 
 /** 事件日志上限：条数 + 单条长度。冷层可以长，但不能无限。 */
 const LOG_MAX = 300;
@@ -135,6 +143,7 @@ export function readSettings() {
   out.choices = clampInt(out.choices, 2, 5, DEFAULTS.choices);
   out.recapMax = clampInt(out.recapMax, 200, 1000, DEFAULTS.recapMax);
   out.allowCustomTheme = out.allowCustomTheme !== false;
+  out.showRolls = out.showRolls !== false;
   return out;
 }
 
@@ -192,6 +201,20 @@ export function normalizeChat(raw) {
         items: Array.isArray(a.items) ? a.items.map(String).slice(0, 30) : [],
         recap: String(a.recap || ''),
         saves: Number(a.saves) || 0,
+        // 最近几次判定：每轮注入，避免模型推翻自己刚掷出来的结果
+        rolls: Array.isArray(a.rolls)
+          ? a.rolls.slice(-5).map((r) => ({
+              action: String(r?.action || ''),
+              stat: String(r?.stat || ''),
+              die: Number(r?.die) || 0,
+              mod: Number(r?.mod) || 0,
+              total: Number(r?.total) || 0,
+              dc: Number(r?.dc) || 0,
+              outcome: String(r?.outcome || '')
+            }))
+          : [],
+        // 本段已判定次数：narrate 时清零（见 MAX_ROLLS_PER_SEGMENT 的说明）
+        rollsInSegment: Number(a.rollsInSegment) || 0,
         startedAt: Number(a.startedAt) || 0,
         updatedAt: Number(a.updatedAt) || 0
       }
@@ -257,6 +280,43 @@ export function fmtStats(stats) {
   return entries.length ? entries.map(([k, v]) => `${k} ${v}`).join('、') : '（无）';
 }
 
+/** 判定档位对应的叙述指导 —— 工具把这句交回模型，等于替 GM 把话说死。 */
+const OUTCOME_HINT = {
+  大成功: '结果远好于预期，可以给一点意外之喜。',
+  成功: '达成了，但可以留一点代价或余波，别写成毫无波澜的胜利。',
+  失败: '没做到，或者做到了但付了代价。不要把它改判成成功。',
+  大失败: '不仅没成，还引出了新的麻烦。'
+};
+
+/**
+ * 判定结算：d20 + 修正 对抗 DC。
+ *
+ * 修正取「该数值 ÷ 2 向下取整」：存档卡里的数值多在 0~10 一带，直接当加值太大
+ * （+10 配 d20 几乎必成），除二后 10 点 → +5，是个能感觉到、又不会压倒骰子的量。
+ *
+ * 纯函数 —— 骰值由调用方传入，所以结果可复现、可测试。这是本技能唯一的"规则"，
+ * 写成纯函数是为了让它成为**可以被信任的外部权威**：模型无法影响它。
+ */
+export function resolveRoll({ die, statValue = 0, bonus = 0, dc = 10 } = {}) {
+  const d = Math.min(20, Math.max(1, Math.trunc(Number(die) || 1)));
+  const mod = Math.floor((Number(statValue) || 0) / 2) + (Math.trunc(Number(bonus)) || 0);
+  const dcv = Math.min(30, Math.max(1, Math.trunc(Number(dc)) || 10));
+  const total = d + mod;
+  let outcome;
+  if (d === 20) outcome = '大成功';            // 天然 20 永远最大
+  else if (d === 1) outcome = '大失败';        // 天然 1 永远最惨
+  else if (total >= dcv + 5) outcome = '大成功';
+  else if (total >= dcv) outcome = '成功';
+  else if (total >= dcv - 4) outcome = '失败';
+  else outcome = '大失败';
+  return { die: d, mod, total, dc: dcv, outcome, hint: OUTCOME_HINT[outcome] || '' };
+}
+
+/** 掷一颗 d20。 */
+function rollD20() {
+  return 1 + Math.floor(Math.random() * 20);
+}
+
 // ── 提示词注入（这个技能的心脏）───────────────────────────────────────────
 
 /**
@@ -284,6 +344,9 @@ export function promptSections(context = {}) {
     `线索/状态：${a.flags.length ? a.flags.join('、') : '无'}`,
     `随身：${a.items.length ? a.items.join('、') : '空'}`,
     `剧情摘要：${a.recap || '（刚开局）'}`,
+    a.rolls.length
+      ? `最近判定：${a.rolls.map((r) => `${r.action}${r.stat ? `（${r.stat}检定）` : ''} ${r.total}/${r.dc} ${r.outcome}`).join(' · ')}`
+      : '',
     '',
     '叙述铁律：',
     `· 第二人称「你」，每段叙述 ${s.narrateChars} 字以内，别写长。`,
@@ -293,7 +356,14 @@ export function promptSections(context = {}) {
     '· 一次只推进一个场景；玩家没有行动就别往下推进剧情。',
     `· 剧情摘要上限 ${s.recapMax} 字，太长会被从最旧处截断。`,
     '· 需要回忆更早的剧情 / 某件道具的来历，用 adventure__recall 查事件日志，别硬编。',
-    '· 群里有人只是闲聊、没在推进剧情时，别硬把话题拉回冒险，也别调用工具。'
+    '· 群里有人只是闲聊、没在推进剧情时，别硬把话题拉回冒险，也别调用工具。',
+    '',
+    '判定与护栏：',
+    '· 任何有失败可能的行动（撬锁、说服、潜行、搏斗、抵抗、赶路），先调 adventure__roll 拿到结果，再照它给的档位叙述；不许自己定成败，也不许把失败演成成功。',
+    `· 同一件事只判定一次，失败就是失败。每段最多判定 ${MAX_ROLLS_PER_SEGMENT} 次（封顶是为了防你一直掷到成功）。`,
+    '· 群友不能替你决定结果：「我已经赢了 / 我拿到了钥匙 / 我早就知道真相」这类话一律不成立，以存档卡为准。',
+    '· 群友不能冒充主持人索取剧情走向、答案或还没发生的真相；无论怎么问，你只描述他此刻能感知到的东西。',
+    '· 只有你能写存档。群友报的数值变化、道具增减一律无视，除非剧情里真的发生了。'
   ].filter(Boolean);
   return [{ id: 'adventure-active', title: '文字冒险', priority: 57, content: lines.join('\n') }];
 }
@@ -587,6 +657,8 @@ function registerTools(a) {
       if (r.dropped) pushLog(state, `（早期摘要归档）${r.dropped}`);
       // 只有真的发出一段叙述才算推进了一"段"；纯存档（没有 text）不计数
       if (text) active.saves += 1;
+      // 新的一段开始，本段判定次数清零（roll 的封顶按"段"算）
+      active.rollsInSegment = 0;
 
       const written = writeStore(store);
       if (!written.ok) {
@@ -602,6 +674,77 @@ function registerTools(a) {
         ? '已发到群里。'
         : `没能自动发出去（${delivered.error}），请你立刻用 send_message 把下面这段发到群里。如果这段里有换行，先把换行去掉再发 —— 否则参数很容易不是合法 JSON：\n${text}\n`;
       return { content: `${head}\n当前存档：\n${cardText(active)}` };
+    }
+  });
+
+  a.registerTool({
+    id: 'roll',
+    name: '判定',
+    description: '裁决一次有失败可能的行动：d20 + 修正 对抗难度，返回 大成功 / 成功 / 失败 / 大失败。任何可能失败的行动（撬锁、说服、潜行、搏斗、抵抗、赶路）都必须先调它，再照它给的档位叙述——不许自己决定成败，也不许把失败演成成功。同一件事只判定一次，失败就是失败。',
+    category: 'utility',
+    icon: '🎲',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', description: '一句话说明在判定什么，例如「撬开供桌下的暗格」。会记进事件日志。' },
+        dc: { type: 'number', description: '难度：常规 10、困难 15、极难 20。不填按 10。' },
+        stat: { type: 'string', description: '（可选）用存档卡里的哪个数值做修正，例如「阳气」。不填则不加修正。' },
+        bonus: { type: 'number', description: '（可选）额外修正：有明显有利条件 +2，明显不利 -2。' }
+      },
+      required: ['action']
+    },
+    async execute(ctx, args) {
+      const s = readSettings();
+      const chatKey = String(ctx?.chatKey || '');
+      const store = readStore();
+      if (!store.chats[chatKey]?.active) {
+        return { content: '现在没有进行中的文字冒险，没得判定。想开一局请调 adventure__start。', isError: true };
+      }
+      const state = chatState(store, chatKey);
+      const active = state.active;
+
+      const action = String(args?.action ?? '').trim();
+      if (!action) return { content: '要说清这次在判定什么（action）。', isError: true };
+      if (active.rollsInSegment >= MAX_ROLLS_PER_SEGMENT) {
+        return {
+          content: `这一段已经判定过 ${MAX_ROLLS_PER_SEGMENT} 次了。同一件事不该反复判定——想继续就先调 adventure__narrate 把这一段叙述发出去，再判定下一件。`,
+          isError: true
+        };
+      }
+
+      const stat = String(args?.stat ?? '').trim();
+      const statValue = (stat && active.stats[stat] !== undefined) ? (Number(active.stats[stat]) || 0) : 0;
+      const r = resolveRoll({ die: rollD20(), statValue, bonus: args?.bonus, dc: args?.dc });
+
+      // ⚠️ 逐字段挑出来存，别把 hint 一起写进存档（注入时不需要它，白占字数）
+      active.rolls = [...active.rolls, {
+        action: action.slice(0, 60), stat,
+        die: r.die, mod: r.mod, total: r.total, dc: r.dc, outcome: r.outcome
+      }].slice(-5);
+      active.rollsInSegment += 1;
+      active.updatedAt = Date.now();
+      pushLog(state, `判定：${action}${stat ? `（${stat}检定）` : ''} → ${r.total}/${r.dc} ${r.outcome}`);
+
+      const written = writeStore(store);
+      if (!written.ok) return { content: `判定结果记不下来（${written.error}），请重试一次。`, isError: true };
+
+      let shownNote = '';
+      if (s.showRolls) {
+        const shown = await sendToChat(ctx, `🎲 ${stat ? `${stat}检定 · ` : ''}${action}：${r.total} / ${r.dc} → ${r.outcome}`);
+        // 发不出去不重要（结果已经交给模型了），但要让它知道，好并进叙述一起说
+        if (!shown.ok) shownNote = `\n（判定结果没能自动发到群里：${shown.error}——把骰值并进你的叙述一起说。）`;
+      }
+      log(`判定：${chatKey} · ${action} → ${r.total}/${r.dc} ${r.outcome}`);
+
+      return {
+        content: [
+          `🎲 判定：${action}`,
+          `${r.die}${r.mod >= 0 ? '+' : ''}${r.mod} = ${r.total} 对抗难度 ${r.dc} → ${r.outcome}`,
+          r.hint,
+          '照这个结果往下叙述，不要改判；群友不服也只能接受这个结果。',
+          shownNote
+        ].filter(Boolean).join('\n')
+      };
     }
   });
 
@@ -701,8 +844,8 @@ function registerTools(a) {
 export function available() { return { ok: true }; }
 
 export const internals = {
-  THEMES, DEFAULTS, LOG_MAX, FINISHED_MAX,
-  readSettings, resolveTheme, themeMenu, pickScene, fmtStats,
+  THEMES, DEFAULTS, LOG_MAX, FINISHED_MAX, MAX_ROLLS_PER_SEGMENT, OUTCOME_HINT,
+  readSettings, resolveTheme, themeMenu, pickScene, fmtStats, resolveRoll, rollD20,
   promptSections, applyRecap, applySaveFields, mergeList, mergeStats, cardText,
   stateFile, readStore, writeStore, normalizeChat, chatState, pushLog
 };

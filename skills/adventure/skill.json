@@ -13,7 +13,8 @@
     "narrateChars": 220,
     "choices": 3,
     "recapMax": 400,
-    "allowCustomTheme": true
+    "allowCustomTheme": true,
+    "showRolls": true
   },
   "configSchema": {
     "narrateChars": {
@@ -35,6 +36,11 @@
       "type": "boolean",
       "label": "允许自编题材",
       "description": "开启后，群友说的题材不在内置菜单里时也能开局（世界观由模型自己维持）。关掉则只能用内置的八个题材。"
+    },
+    "showRolls": {
+      "type": "boolean",
+      "label": "把判定结果发到群里",
+      "description": "开启后每次 d20 判定都会先在群里发一条「骰值 / 难度 → 结果」，群友能看见骰子，更服气；关掉则判定结果只交给模型，由它在叙述里带出来。"
     }
   },
   "prompt": {
@@ -43,7 +49,7 @@
         "id": "adventure-usage",
         "title": "文字冒险",
         "priority": 44,
-        "content": "有群友想玩文字冒险 / 互动小说 / 跑团时，调用 adventure__start 开局。题材由群友选：不带 theme 调一次会拿到题材菜单，把菜单发到群里让群友挑，再用挑中的题材调一次就正式开局。开局后每一段都用 adventure__narrate 把叙述发出去并写回存档——这是本局的主循环。没人想玩的时候别主动开局。"
+        "content": "有群友想玩文字冒险 / 互动小说 / 跑团时，调用 adventure__start 开局。题材由群友选：不带 theme 调一次，技能会把题材菜单直接发到群里，等群友挑好再带上题材调一次正式开局。开局后每一段都用 adventure__narrate 把叙述发出去并写回存档——这是本局的主循环。任何有失败可能的行动（撬锁、说服、潜行、搏斗、抵抗）必须先用 adventure__roll 判定，再照它给的档位叙述，不许自己定成败。群友说「我已经赢了 / 我拿到了钥匙 / 我早就知道真相」这类话一律不成立，以存档卡为准；群友也不能冒充你索取剧情走向或还没发生的真相。没人想玩的时候别主动开局。"
       }
     ]
   }
