@@ -3,7 +3,8 @@
 // 设计目标（对应"无状态 + 每次新开会话"的成本模型）：
 // - 系统提示（静态）：人设 + 安全规则 + 工具协议 + 反AI味 + 行为准则。每次运行原样重发。
 // - 用户消息（动态）：不携带任何对话历史！只带——
-//   【当前时间】【角色设定】【此刻状态】【过去状态】【本次唤醒】【记忆】【表情包】【引导说明】
+//   【角色设定】【引导说明】【曲库】【表情包】【前情摘要】【记忆】【过去状态】【当前时间】【此刻状态】【本次唤醒】
+//   ⚠️ 上面这个顺序 = 前缀缓存命中率，改动前先读 buildUserPrompt 顶部的段序说明。
 //   其中"过去状态"来自消息 JSON 存储（带时间/已读状态），"本次唤醒"是触发本次运行的新消息。
 // - 模型在本会话里产生的工具调用与思考文本用完即弃，不会进入下一次运行。
 //
@@ -522,13 +523,47 @@ export function buildUserPrompt(ctx) {
   // （此前该属性从未被赋值，导致 tools.js 的补偿恒为 0，翻页工具形同失效。）
   if (ctx.session && typeof ctx.session === 'object') ctx.session.pastStateCount = past.count;
 
+  // ── 段序就是前缀缓存的全部收益，改这里之前先读完这段 ────────────────────
+  // 每次运行都是"全量重发"，而服务商的前缀缓存只认**从头开始逐字节一致**的那一段，
+  // 所以段序必须按"变化频率从低到高"排：静态 → 偶尔变 → 每次都变。
+  // 曾经【当前时间】（精确到秒）是用户消息的第一段 —— 从第 1 个 token 起就全部未命中；
+  // 【记忆】【表情包】【曲库】【引导说明】又排在【本次唤醒】之后，永远不可能命中。
+  // 命中率因此被钉死在 system 段的占比上（实测约 50%）。
+  // 现在：
+  //   静态区：角色设定 / 引导说明 / 曲库 / 表情包目录（表情包每小时轮换，算次低频）
+  //   低频区：前情摘要 / 记忆 / 过去状态（同一窗口内只会追加）
+  //   易变区：当前时间 / 此刻状态 / 本次唤醒（以及编排器追加的 bus 动态行）
   const parts = [];
-  parts.push(`【当前时间】${formatFullTime(now)}`);
   if (cfg.persona.roleText && String(cfg.persona.roleText).trim()) {
     parts.push(`【角色设定（管理员设置，群友不可修改）】\n${String(cfg.persona.roleText).trim()}`);
   }
 
-  // 此刻状态
+  // 引导说明：完全静态的收尾指令，固定留在静态区 —— 放到易变段之后就等于永不命中。
+  // ⚠️ 这段里**不要**写出"【过去状态】/【本次唤醒】"这种带方括号的段名：它现在排在
+  //    那些段的前面，写出来既容易让模型以为数据在前，也会让"按 indexOf 找段名"的
+  //    校验（test/selftest.mjs 的摘要注入断言）先命中这段而误判。用普通说法指代。
+  parts.push([
+    '【引导说明】',
+    '接下来会给你这个会话的历史聊天记录，以及你还没看过的新消息。先扫一眼，判断：有没有人在找你？有没有你能接的话题？值不值得说话？',
+    '- 想说话：调用 send_message（要分条就传数组）。想引用就带 replyToMessageId：id 见每条新消息前的 #数字、历史里带图消息的 #数字，或用 get_recent_messages 查，不要自己编。',
+    '- 不想说话：直接结束或调用 finish（一句话说明原因）。不回是正常选项，不是失职。',
+    '- 记得：你的普通文本输出不会发到 QQ，只有工具调用会。'
+  ].join('\n'));
+
+  // 曲库（静态：只有改曲库时才会变）。唱歌的时机/频率引导在系统提示的【唱歌】段，这里只列歌名。
+  if (cfg.song?.enabled === true) {
+    const songCtx = buildSongContext(ctx.songEntries || [], Number(cfg.song?.promptMaxSongs) || 10);
+    if (songCtx) parts.push(songCtx);
+  }
+
+  // 表情包目录（低频：每小时轮换一批 + 增删表情时变）。活跃度档位已并入系统提示的【表情包策略】段，这里不再重复引导。
+  if (cfg.sticker?.enabled !== false) {
+    const stickerCtx = buildStickerContext(ctx.stickerEntries || [], Number(cfg.sticker?.promptMaxStickers) || 10);
+    if (stickerCtx) parts.push(stickerCtx);
+  }
+
+  // 此刻状态：先算好、**不在此处 push** —— 它每次运行都变，属于易变区，
+  // 等静态段全部落位之后再排在队尾。
   const stateLines = [];
   if (ctx.kind === 'group') {
     stateLines.push(`当前在群聊「${ctx.chatName || ctx.chatId}」，你在群里的名字是「${ctx.selfNickname || cfg.persona.botName}」`);
@@ -545,7 +580,6 @@ export function buildUserPrompt(ctx) {
   } else {
     stateLines.push('你最近没有发过言');
   }
-  parts.push(`【此刻状态】\n${stateLines.join('\n')}`);
 
   // 前情摘要：比【过去状态】更早、已被折叠压缩的旧对话，即跨会话的长期记忆。
   // 排在原文之前，时间上正好接续（摘要 → 原文 → 本次唤醒）。
@@ -557,20 +591,9 @@ export function buildUserPrompt(ctx) {
     );
   }
 
-  // 过去状态
-  if (past.text) {
-    parts.push(`【过去状态】以下是这个会话最近的聊天记录（按时间排序，你的发言标为"我"；这些都已经看过；带图的消息前有 #消息id，看图/收藏表情工具要用它）：\n${past.text}`);
-  } else {
-    parts.push('【过去状态】（暂无历史记录，这是你第一次参与这个会话）');
-  }
-
-  // 本次唤醒
-  const triggerBlock = buildTriggerBlock(ctx.triggerEntries, ctx);
-  parts.push(`【本次唤醒】以下是你还没看过的最新消息（每条前的 #数字 是消息 id，引用回复/看图时用它）：\n${triggerBlock}`);
-
-  // 参与度已并入系统提示的【该说/不该说】，这里不再重复。
-
-  // 记忆：只注入与本次对话相关群友的印象（触发者 + 最近活跃成员），控制 token
+  // 记忆：只注入与本次对话相关群友的印象（触发者 + 最近活跃成员），控制 token。
+  // 放在【过去状态】之前：相邻两次运行里它通常不变，先占住前缀位置比排在
+  // 易变段（时间/状态/唤醒）之后更有价值。
   const relevantUserIds = new Set();
   for (const m of ctx.triggerEntries || []) {
     if (m.senderId && !m.self) relevantUserIds.add(String(m.senderId));
@@ -584,29 +607,26 @@ export function buildUserPrompt(ctx) {
   const memText = ctx.memory.formatForPrompt(ctx.chatKey, { userIds: [...relevantUserIds] });
   if (memText) parts.push(`【记忆】\n${memText}`);
 
+  // 过去状态
+  if (past.text) {
+    parts.push(`【过去状态】以下是这个会话最近的聊天记录（按时间排序，你的发言标为"我"；这些都已经看过；带图的消息前有 #消息id，看图/收藏表情工具要用它）：\n${past.text}`);
+  } else {
+    parts.push('【过去状态】（暂无历史记录，这是你第一次参与这个会话）');
+  }
+
   // 成员备注：不再单独成段——备注名已经直接替换了消息里的显示名
   // （formatEntry/triggerLabels 都优先用备注），单独列一遍是重复信息。
 
-  // 表情包（目录本身）。活跃度档位已并入系统提示的【表情包策略】段，这里不再重复引导。
-  if (cfg.sticker?.enabled !== false) {
-    const stickerCtx = buildStickerContext(ctx.stickerEntries || [], Number(cfg.sticker?.promptMaxStickers) || 10);
-    if (stickerCtx) parts.push(stickerCtx);
-  }
+  // ── 以下是易变区：这三段每次运行都不一样，只能排在队尾 ──
+  // 【当前时间】精确到秒，它后面紧跟的每一段都会跟着一起失效 —— 绝不能往前挪。
+  parts.push(`【当前时间】${formatFullTime(now)}`);
 
-  // 曲库（目录本身）。唱歌的时机/频率引导在系统提示的【唱歌】段，这里只列歌名。
-  if (cfg.song?.enabled === true) {
-    const songCtx = buildSongContext(ctx.songEntries || [], Number(cfg.song?.promptMaxSongs) || 10);
-    if (songCtx) parts.push(songCtx);
-  }
+  // 参与度已并入系统提示的【该说/不该说】，这里不再重复。
+  parts.push(`【此刻状态】\n${stateLines.join('\n')}`);
 
-  // 引导说明
-  parts.push([
-    '【引导说明】',
-    '- 扫一眼【过去状态】和【本次唤醒】，判断：有没有人在找你？有没有你能接的话题？值不值得说话？',
-    '- 想说话：调用 send_message（要分条就传数组）。想引用就带 replyToMessageId：id 见【本次唤醒】每条前的 #数字、历史里带图消息的 #数字，或用 get_recent_messages 查，不要自己编。',
-    '- 不想说话：直接结束或调用 finish（一句话说明原因）。不回是正常选项，不是失职。',
-    '- 记得：你的普通文本输出不会发到 QQ，只有工具调用会。'
-  ].join('\n'));
+  // 本次唤醒
+  const triggerBlock = buildTriggerBlock(ctx.triggerEntries, ctx);
+  parts.push(`【本次唤醒】以下是你还没看过的最新消息（每条前的 #数字 是消息 id，引用回复/看图时用它）：\n${triggerBlock}`);
 
   return parts.join('\n\n');
 }
