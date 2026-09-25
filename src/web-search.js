@@ -521,63 +521,205 @@ export function extractPageDigest(html, _baseUrl = '', { maxChars = 6000, maxLin
 // ── 图片搜索 ──────────────────────────────────────────────────────────────
 
 /**
+ * 图搜页面的读取上限：**不能沿用 safeFetch 的默认 5 万字符**。
+ *
+ * 实测（2026-09）：Bing 图搜页约 58 万字符，首个结果块 `m="…"` 出现在第 25 万
+ * 字符附近。默认上限下解析器只看得到页面开头 —— 于是百度、Bing 会**同时**报
+ * "没解析到结果"，看上去像两家一起改版，实际是我们只读到了页面开头。
+ * 修复后同一段解析逻辑能正常捞出 8 条直链。别把这个值调回默认。
+ */
+export const IMAGE_PAGE_MAX_CHARS = 1500000;
+
+/**
+ * 反爬 / 人机验证页的特征（前 4KB 足够判定）。
+ *
+ * 命中时必须报"出口 IP 被风控"，不能报"页面结构可能已改版" ——
+ * 这两件事的排查方向完全相反：改版要改解析器，风控要换 IP 或等待。
+ * 百度对可疑出口 IP 会直接返回一个 1.4KB 的「百度安全验证」页。
+ */
+const BLOCK_PAGE_RE = /百度安全验证|请点击完成验证|请输入验证码|网络不给力|Just a moment\.\.\.|cf-browser-verification|Enable JavaScript and cookies/i;
+
+/** 响应是不是人机验证页。 */
+export function isBlockPage(html) {
+  return BLOCK_PAGE_RE.test(String(html ?? '').slice(0, 4000));
+}
+
+/** 命中验证页就抛"风控"而不是"改版"（导出供单测）。 */
+export function assertNotBlocked(html, source) {
+  if (isBlockPage(html)) {
+    throw new Error(`${source}返回了人机验证页（出口 IP 被风控）—— 换出口 IP 或稍后再试`);
+  }
+}
+
+/**
+ * 从 Bing 图搜页解析图片直链（纯函数，便于单测）。
+ *
+ * Bing 把结果塞在结果块的属性里：`m="{&quot;murl&quot;:&quot;…&quot;}"`，
+ * 所以要先还原 HTML 实体、再按 JSON 解；偶尔是被截断的非法 JSON，用正则兜一次。
+ */
+export function parseBingImageUrls(html, limit = 8) {
+  const max = Math.max(1, Number(limit) || 8);
+  const out = [];
+  const seen = new Set();
+  for (const m of String(html ?? '').matchAll(/m="([^"]+)"/g)) {
+    const raw = decodeHtml(m[1]).replace(/&quot;/g, '"');
+    let url = '';
+    try {
+      const j = JSON.parse(raw);
+      url = String(j.murl || j.mediaurl || '').trim();
+    } catch {
+      // 属性里偶尔不是合法 JSON（被截断），用正则兜一次
+      const mm = raw.match(/"murl"\s*:\s*"([^"]+)"/);
+      url = mm ? mm[1] : '';
+    }
+    if (!/^https?:\/\//i.test(url) || seen.has(url)) continue;
+    seen.add(url);
+    out.push(url);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+/**
+ * 从百度图搜页解析图片直链（纯函数，便于单测）。
+ * 百度把直链放在 `objURL`（近年版改成 `thumbURL`/`middleURL`，都能兜），
+ * 且斜杠可能是转义的（`https:\/\/…`），要还原。
+ */
+export function parseBaiduImageUrls(html, limit = 8) {
+  const text = String(html ?? '');
+  const max = Math.max(1, Number(limit) || 8);
+  const out = [];
+  const seen = new Set();
+  for (const key of ['objURL', 'middleURL', 'thumbURL', 'hoverURL']) {
+    const re = new RegExp(`"${key}"\\s*:\\s*"([^"]+)"`, 'g');
+    for (const m of text.matchAll(re)) {
+      const u = decodeHtml(m[1]).replace(/\\\//g, '/');
+      if (!/^https?:\/\//i.test(u) || seen.has(u)) continue;
+      seen.add(u);
+      out.push(u);
+      if (out.length >= max) break;
+    }
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+/**
+ * 解析不到结果时的报错：**带上"读了多少字符"**。
+ * 有了这个数字，"被截断挡住"和"结构真改了"一眼可分 ——
+ * 原先只有一句"页面结构可能已改版"，把排查引向了错误方向。
+ */
+function noImageResultError(source, html) {
+  const read = String(html ?? '').length;
+  const cut = read >= IMAGE_PAGE_MAX_CHARS ? '，已触及读取上限' : '';
+  return new Error(`${source}没解析到图片（已读取 ${read} 字符${cut}）—— 可能是页面结构变化，或该出口 IP 被风控`);
+}
+
+/**
  * Bing 图片搜索。
  *
- * 做法：请求图片搜索页，从结果块里捞 `murl`（媒体直链）与 `turl`（缩略图）。
- * Bing 把这两者塞在 `m="{\"murl\":\"...\",\"turl\":\"...\"}"` 这样的 JSON 属性里。
- * 解析失败就抛错（页面改版了），由调用方决定降级。
+ * 做法：请求图片搜索页，从结果块里捞 `murl`（媒体直链）。
+ * Bing 把直链塞在 `m="{\"murl\":\"…\"}"` 这样的 JSON 属性里。
+ * 解析失败就抛错，由调用方决定降级。
  */
 export async function bingImageSearch(query, { limit = 8, browseLocked = false } = {}) {
   const q = String(query ?? '').trim();
   if (!q) throw new Error('搜索关键词为空');
   const url = `https://cn.bing.com/images/search?q=${encodeURIComponent(q)}&form=HDRSC2`;
   // 图搜是"搜索阶段"，也必须受浏览锁定约束，否则锁定只挡下载不挡搜索，链条断一环
-  const { body } = await safeFetch(url, { browseLocked });
+  const { body } = await safeFetch(url, { browseLocked, maxChars: IMAGE_PAGE_MAX_CHARS });
   const html = String(body ?? '');
+  assertNotBlocked(html, 'Bing 图片搜索');
+  const urls = parseBingImageUrls(html, limit);
+  if (!urls.length) throw noImageResultError('Bing 图片搜索', html);
+  return urls.map((u) => ({ title: q, url: u }));
+}
+
+/**
+ * 图搜请求头：百度的接口与页面**都只认浏览器 UA**。
+ * 实测：用 safeFetch 的默认 UA（qq-agent/1.0）请求 acjson 接口，只回 83 字节；
+ * 换成浏览器 UA + referer 就能拿到完整 JSON。所以这里显式覆盖。
+ */
+const IMAGE_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+const BAIDU_JSON_HEADERS = {
+  'user-agent': IMAGE_UA,
+  referer: 'https://image.baidu.com/',
+  accept: 'application/json, text/plain, */*'
+};
+const BAIDU_HTML_HEADERS = {
+  'user-agent': IMAGE_UA,
+  referer: 'https://image.baidu.com/',
+  accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+};
+
+/**
+ * 从百度图搜 JSON 接口的响应里取直链（纯函数，便于单测）。
+ * data[] 的最后一条常是空对象（百度固定追加的占位项），过滤即可。
+ */
+export function parseBaiduJsonImages(jsonText, limit = 8) {
+  const max = Math.max(1, Number(limit) || 8);
+  let data = null;
+  try { data = JSON.parse(String(jsonText ?? '')); } catch { return []; }
+  const list = Array.isArray(data?.data) ? data.data : [];
   const out = [];
   const seen = new Set();
-  for (const m of html.matchAll(/m="([^"]+)"/g)) {
-    const raw = decodeHtml(m[1]).replace(/&quot;/g, '"');
-    let url2 = '';
-    try {
-      const j = JSON.parse(raw);
-      url2 = String(j.murl || j.mediaurl || '').trim();
-    } catch {
-      // 属性里偶尔不是合法 JSON（被截断），用正则兜一次
-      const mm = raw.match(/"murl"\s*:\s*"([^"]+)"/);
-      url2 = mm ? mm[1] : '';
-    }
-    if (!/^https?:\/\//i.test(url2) || seen.has(url2)) continue;
-    seen.add(url2);
-    out.push({ title: q, url: url2 });
-    if (out.length >= Math.max(1, Number(limit) || 8)) break;
+  for (const item of list) {
+    const u = String(item?.thumbURL || item?.middleURL || item?.hoverURL || item?.objURL || '').trim();
+    if (!/^https?:\/\//i.test(u) || seen.has(u)) continue;
+    seen.add(u);
+    out.push(u);
+    if (out.length >= max) break;
   }
-  if (!out.length) throw new Error('Bing 图片搜索没解析到结果（页面结构可能已改版）');
   return out;
 }
 
-/** 百度图片搜索。百度把直链放在 `objURL`（近年版改成 `thumbURL`/`middleURL`，都能兜）。 */
+/**
+ * 百度图片搜索。
+ *
+ * ── 为什么改成"先走 JSON 接口、HTML 抠取兜底"（2026-09）──────────────
+ * 原先只抠 HTML，但百度的图片结果早就是前端 XHR 拉出来的，HTML 里没有内联数据；
+ * 加上它对可疑出口 IP 会直接回一个 1.4KB 的「百度安全验证」页 —— 同一段代码
+ * 时而"没解析到结果"、时而拿到验证页，排查时极易被误判成"页面改版"。
+ * acjson 接口拿到的就是它自己渲染用的数据，稳定得多，故改为主路径。
+ */
 export async function baiduImageSearch(query, { limit = 8, browseLocked = false } = {}) {
   const q = String(query ?? '').trim();
   if (!q) throw new Error('搜索关键词为空');
-  const url = `https://image.baidu.com/search/index?tn=baiduimage&word=${encodeURIComponent(q)}`;
-  const { body } = await safeFetch(url, { browseLocked });
-  const html = String(body ?? '');
-  const out = [];
-  const seen = new Set();
-  for (const key of ['objURL', 'middleURL', 'thumbURL', 'hoverURL']) {
-    const re = new RegExp(`"${key}"\\s*:\\s*"([^"]+)"`, 'g');
-    for (const m of html.matchAll(re)) {
-      const u = decodeHtml(m[1]).replace(/\\\//g, '/');
-      if (!/^https?:\/\//i.test(u) || seen.has(u)) continue;
-      seen.add(u);
-      out.push({ title: q, url: u });
-      if (out.length >= Math.max(1, Number(limit) || 8)) break;
-    }
-    if (out.length >= Math.max(1, Number(limit) || 8)) break;
+  const n = Math.max(1, Number(limit) || 8);
+  const errors = [];
+
+  // 首选：JSON 接口（结果就是它渲染用的数据，天然不怕页面改版）
+  try {
+    const rn = Math.max(1, Math.min(30, n * 3));   // 多要几条，接口会掺少量无图的占位项
+    const api = 'https://image.baidu.com/search/acjson?tn=resultjson_com&ipn=rj'
+      + `&word=${encodeURIComponent(q)}&pn=0&rn=${rn}`;
+    // 仍走 safeFetch：保住 SSRF 防护与浏览锁定，只是覆盖了 UA/referer
+    const { body } = await safeFetch(api, { browseLocked, maxChars: 200000, headers: BAIDU_JSON_HEADERS });
+    const text = String(body ?? '');
+    assertNotBlocked(text, '百度图片搜索');
+    const urls = parseBaiduJsonImages(text, n);
+    if (urls.length) return urls.map((u) => ({ title: q, url: u }));
+    errors.push(`JSON 接口未返回图片（读了 ${text.length} 字节）`);
+  } catch (error) {
+    errors.push(`JSON 接口：${error?.message ?? error}`);
   }
-  if (!out.length) throw new Error('百度图片搜索没解析到结果（页面结构可能已改版）');
-  return out;
+
+  // 兜底：HTML 抠取（个别版本 / 出口 IP 只有这条路）
+  try {
+    const url = `https://image.baidu.com/search/index?tn=baiduimage&word=${encodeURIComponent(q)}`;
+    const { body } = await safeFetch(url, {
+      browseLocked, maxChars: IMAGE_PAGE_MAX_CHARS, headers: BAIDU_HTML_HEADERS
+    });
+    const html = String(body ?? '');
+    assertNotBlocked(html, '百度图片搜索');
+    const urls = parseBaiduImageUrls(html, n);
+    if (urls.length) return urls.map((u) => ({ title: q, url: u }));
+    errors.push(noImageResultError('百度图片搜索', html).message);
+  } catch (error) {
+    errors.push(`页面抠取：${error?.message ?? error}`);
+  }
+
+  throw new Error(`百度图片搜索失败 —— ${errors.join('；')}`);
 }
 
 /**

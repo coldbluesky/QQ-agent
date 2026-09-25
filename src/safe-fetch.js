@@ -255,7 +255,7 @@ function readBounded(res, maxBytes, asText) {
 }
 
 // 使用已校验的 IP 发起请求（保留 Host/SNI），从根上消除 DNS rebinding。
-function requestOnce(url, ip, { asBinary = false, maxBytes = 50000 } = {}) {  return new Promise((resolve, reject) => {
+function requestOnce(url, ip, { asBinary = false, maxBytes = 50000, headers = {} } = {}) {  return new Promise((resolve, reject) => {
     const mod = url.protocol === 'https:' ? https : http;
     const port = url.port || (url.protocol === 'https:' ? 443 : 80);
     const req = mod.request({
@@ -264,10 +264,15 @@ function requestOnce(url, ip, { asBinary = false, maxBytes = 50000 } = {}) {  re
       path: url.pathname + url.search,
       method: 'GET',
       headers: {
-        host: url.host,
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) qq-agent/1.0',
         accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8,image/avif,image/webp,image/*;q=0.8',
-        'accept-language': 'zh-CN,zh;q=0.9'
+        'accept-language': 'zh-CN,zh;q=0.9',
+        // 调用方可以覆盖 UA/accept 这类内容协商头（图搜接口只认浏览器 UA，
+        // 匿名 UA 会被风控 —— 实测百度接口对默认 UA 只回 83 字节）。
+        ...headers,
+        // host 与连接目标必须由我们决定，绝不能被 headers 覆盖：
+        // 它俩是 SSRF 防护的一部分（连的是校验过的 IP，Host 指回域名）。
+        host: url.host,
+        'user-agent': String(headers['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) qq-agent/1.0')
       },
       servername: url.protocol === 'https:' ? url.hostname : undefined,
       rejectUnauthorized: url.protocol === 'https:',
@@ -291,14 +296,34 @@ function requestOnce(url, ip, { asBinary = false, maxBytes = 50000 } = {}) {  re
 
 const MAX_REDIRECTS = 5;
 
-/** 抓取网页文本（≤50000 字符），SSRF 全防护（不做内网例外）。 */
-export async function safeFetch(urlString, { browseLocked = false } = {}) {
+// 网页文本读取上限。
+// 默认 5 万够"读一篇文章"，但有类页面必须能调大：图搜这种结果块被压在
+// 几十万字符的 JS 外壳之后（实测 Bing 的首个结果块在第 25 万字符附近），
+// 只给 5 万的话解析器永远只看得到页面开头，表现为"一条都解析不到"。
+// 上限 200 万字符（≈4MB 内存）足够覆盖这类页面，又不至于被超大响应拖垮进程。
+const DEFAULT_TEXT_CHARS = 50000;
+const MAX_TEXT_CHARS = 2000000;
+
+/**
+ * 抓取网页文本，SSRF 全防护（不做内网例外）。
+ *
+ * @param {string} urlString
+ * @param {object} [opts]
+ * @param {boolean} [opts.browseLocked] 浏览锁定（逐跳校验域名白名单）
+ * @param {number}  [opts.maxChars]     读取上限，默认 50000，上限 2000000。
+ *   注意实现细节：内部按**字节**累计判断是否读满，最后按**码点**截断字符串，
+ *   所以中文为主的页面实际拿到的字符数会少于这个值（UTF-8 中文 1 字符 3 字节）。
+ * @param {object}  [opts.headers]      附加请求头（如抓图搜接口需要浏览器 UA）。
+ *   host 与连接目标**不可**被覆盖，那是 SSRF 防护的一部分。
+ */
+export async function safeFetch(urlString, { browseLocked = false, maxChars = DEFAULT_TEXT_CHARS, headers = {} } = {}) {
+  const cap = Math.max(1000, Math.min(MAX_TEXT_CHARS, Number(maxChars) || DEFAULT_TEXT_CHARS));
   // 锁定校验放在**最前面**，连 DNS 都不做 —— 不在白名单就根本不该发起连接
   const lock = browseLocked ? checkBrowseLock(urlString) : { enabled: false, allowed: true, host: '' };
   if (!lock.allowed) throw new Error(`浏览锁定：${lock.host || '该地址'} 不在允许的域名清单内`);
   let { url, ip } = await validateFetchUrl(urlString);
   for (let i = 0; i <= MAX_REDIRECTS; i++) {
-    const result = await requestOnce(url, ip, { asBinary: false, maxBytes: 50000 });
+    const result = await requestOnce(url, ip, { asBinary: false, maxBytes: cap, headers });
     if ([301, 302, 303, 307, 308].includes(result.statusCode)) {
       if (!result.redirect) throw new Error(`重定向缺少 Location: ${result.statusCode}`);
       const next = new URL(result.redirect, url).toString();
@@ -312,7 +337,9 @@ export async function safeFetch(urlString, { browseLocked = false } = {}) {
       continue;
     }
     const body = result.body || '';
-    return { url: url.toString(), statusCode: result.statusCode, truncated: body.length >= 50000, body };
+    // truncated 必须按本次实际的 cap 判，不能写死 50000 —— 否则调大上限后
+    // 这个标记会永远为 true，调用方无法区分"读全了"和"被截断了"。
+    return { url: url.toString(), statusCode: result.statusCode, truncated: body.length >= cap, body, maxChars: cap };
   }
   throw new Error('重定向次数过多，已停止');
 }

@@ -1967,6 +1967,68 @@ refs:
     pass('本地表情 URI：POSIX/Windows/幂等 + 历史脏数据自愈 + 受控目录判定');
   }
 
+  // ── 场景 43：图搜解析（fixture 用真实抓到的页面结构）──
+  // 回归：两家同时报"没解析到结果（页面结构可能已改版）"，实际是 safeFetch 把响应
+  // 截断在 5 万字符 —— 而 Bing 图搜页约 58 万字符、首个结果块在第 25 万字符附近。
+  {
+    const ws = await import('../src/web-search.js');
+
+    // Bing：直链塞在结果块属性里 m="{&quot;murl&quot;:&quot;…&quot;}"（取自真实页面）
+    const bingHtml = [
+      '<a class="iusc" style="height:208px;width:245px" m="{&quot;sid&quot;:&quot;&quot;,&quot;murl&quot;:&quot;https://img.example.com/a.jpg&quot;,&quot;turl&quot;:&quot;https://t.example.com/a.jpg&quot;}"></a>',
+      '<a class="iusc" m="{&quot;murl&quot;:&quot;https://img.example.com/b.png&quot;}"></a>',
+      '<a class="iusc" m="{&quot;murl&quot;:&quot;https://img.example.com/a.jpg&quot;}"></a>'
+    ].join('\n');
+    assert.deepStrictEqual(
+      ws.parseBingImageUrls(bingHtml, 8),
+      ['https://img.example.com/a.jpg', 'https://img.example.com/b.png'],
+      'Bing：解析 murl、还原 HTML 实体、去重'
+    );
+    assert.deepStrictEqual(ws.parseBingImageUrls('<html>没有结果块</html>', 8), [], 'Bing：无结果块时返回空数组');
+
+    // 百度：直链在 objURL/middleURL/thumbURL 里，斜杠可能是转义的
+    const baiduHtml = '"objURL":"https:\\/\\/img.example.com\\/1.jpg","middleURL":"https://img.example.com/2.jpg"'
+      + ',"thumbURL":"https://img.example.com/1.jpg"';
+    const baiduUrls = ws.parseBaiduImageUrls(baiduHtml, 8);
+    assert.ok(baiduUrls.includes('https://img.example.com/1.jpg'), '百度：objURL 的转义斜杠应还原');
+    assert.ok(baiduUrls.includes('https://img.example.com/2.jpg'), '百度：middleURL 兜底生效');
+    assert.strictEqual(new Set(baiduUrls).size, baiduUrls.length, '百度：结果去重');
+
+    // 百度首选的 JSON 接口（acjson）：结果就在 data[] 里，最后一条常是空占位项
+    const baiduJson = JSON.stringify({
+      queryExt: '猫咪',
+      data: [
+        { thumbURL: 'https://img2.baidu.com/it/u=1&f=JPEG', middleURL: 'https://img2.baidu.com/it/u=1&f=JPEG' },
+        { thumbURL: 'https://img0.baidu.com/it/u=2&f=JPEG' },
+        {}
+      ]
+    });
+    assert.deepStrictEqual(
+      ws.parseBaiduJsonImages(baiduJson, 8),
+      ['https://img2.baidu.com/it/u=1&f=JPEG', 'https://img0.baidu.com/it/u=2&f=JPEG'],
+      '百度：从 JSON 接口 data[] 取直链、跳过空占位项、去重'
+    );
+    assert.deepStrictEqual(ws.parseBaiduJsonImages('这不是 JSON', 8), [], '百度：非 JSON 响应应返回空数组而不是抛错');
+
+    // 反爬页必须报"风控"，不能报"改版" —— 后者会把排查方向带偏
+    assert.throws(
+      () => ws.assertNotBlocked('<title>百度安全验证</title>', '百度图片搜索'),
+      /风控/,
+      '人机验证页应报"出口 IP 被风控"'
+    );
+    assert.doesNotThrow(
+      () => ws.assertNotBlocked('<html><title>猫咪 - 搜索 图片</title></html>', 'Bing 图片搜索'),
+      '正常结果页不该被误判为验证页'
+    );
+
+    // 读取上限必须显著大于 safeFetch 默认值，否则结果块永远读不到
+    assert.ok(
+      ws.IMAGE_PAGE_MAX_CHARS >= 1000000,
+      `图搜读取上限应 ≥ 100 万字符（实际 ${ws.IMAGE_PAGE_MAX_CHARS}）—— 退回默认 5 万会让两家一起"没解析到结果"`
+    );
+    pass('图搜解析：Bing/百度结构解析与去重 + 反爬页识别 + 读取上限');
+  }
+
   // ── 收尾 ──
   await app.stop();
   onebotWs.close();
