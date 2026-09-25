@@ -287,6 +287,7 @@ export function promptSections(context = {}) {
     '',
     '叙述铁律：',
     `· 第二人称「你」，每段叙述 ${s.narrateChars} 字以内，别写长。`,
+    '· 叙述写成连续的一段，不要用换行分段：QQ 里换行会被拆成多条，而且换行符是工具参数写坏 JSON 的主要原因。',
     `· 结尾给 ${s.choices} 个左右的具体行动选项，同时允许群友自由输入别的行动。`,
     '· 绝不替玩家做决定，也不要替玩家宣告他的选择。',
     '· 一次只推进一个场景；玩家没有行动就别往下推进剧情。',
@@ -322,6 +323,28 @@ async function sendToChat(ctx, text) {
   } catch (error) {
     return { ok: false, error: error?.message ?? String(error) };
   }
+}
+
+/**
+ * 把题材菜单直接发到群里。
+ *
+ * ⚠️ 为什么不让模型转发：菜单是多行文本，模型得把它塞进 send_message 的 JSON
+ * 字符串参数里 —— 那正是它最容易写坏的地方（实测就出现过错把值写成不带引号的
+ * 多行文本，直接被判「参数不是合法 JSON」，整局卡在开局）。由技能自己发，
+ * 模型一行都不用操心，也不可能写坏。
+ */
+async function deliverMenu(ctx) {
+  const menu = themeMenu();
+  const delivered = await sendToChat(ctx, menu);
+  if (delivered.ok) {
+    return '题材菜单已经发到群里了，你不需要再重复一遍。等群友挑好题材，再带上 theme 调一次 adventure__start 正式开局。';
+  }
+  return [
+    `菜单没能自动发出去（${delivered.error}），请你用 send_message 发给群友。`,
+    '注意：别把这一整段多行文本塞进参数里 —— 按题材拆成几条短消息发（先发标题、再发编号列表），每条都不要带换行，否则参数很容易不是合法 JSON。',
+    '',
+    menu
+  ].join('\n');
 }
 
 // ── 存档卡的读写 ─────────────────────────────────────────────────────────
@@ -462,14 +485,17 @@ function registerTools(a) {
 
       const asked = String(args?.theme ?? '').trim();
       if (!asked) {
-        // 只出菜单，不动存档 —— 群友还要挑
-        return { content: `${themeMenu()}\n\n把上面这段（可以自己润色）发到群里让群友挑，然后用挑中的题材再调一次 adventure__start。` };
+        // 只出菜单、不动存档 —— 群友还要挑。菜单由技能自己发（见 deliverMenu 的说明）。
+        return { content: await deliverMenu(ctx) };
       }
 
       let theme = resolveTheme(asked);
       if (!theme) {
         if (!s.allowCustomTheme) {
-          return { content: `「${asked}」不在内置题材里（设置里关掉了「允许自编题材」）。\n${themeMenu()}\n\n请群友从上面挑一个。`, isError: true };
+          return {
+            content: `「${asked}」不在内置题材里（设置里关掉了「允许自编题材」），请群友从菜单里挑一个。\n${await deliverMenu(ctx)}`,
+            isError: true
+          };
         }
         // 自编题材：世界观交给模型自己维持，数值留空
         theme = {
@@ -531,7 +557,7 @@ function registerTools(a) {
     parameters: {
       type: 'object',
       properties: {
-        text: { type: 'string', description: '要发到群里的叙述正文（第二人称，别超过设定字数）。留空 = 只写存档、不发言。' },
+        text: { type: 'string', description: '要发到群里的叙述正文。第二人称、别超过设定字数，并且写成连续一段、不要带换行（换行在 QQ 里会被拆条，也最容易把参数写坏成非法 JSON）。留空 = 只写存档、不发言。' },
         scene: { type: 'string', description: '当前场景的一句话（地点 + 时间/氛围），覆盖旧值。场景切换时必填。' },
         recap: { type: 'string', description: '（可选）整体重写的剧情摘要——只在旧摘要太乱太长时用它压一次。日常请用 beat。' },
         beat: { type: 'string', description: '（可选）这一段发生的剧情，会追加到摘要末尾。日常用这个，不需要重写旧内容。' },
@@ -574,7 +600,7 @@ function registerTools(a) {
       log(`叙述：${chatKey} · 第 ${active.saves} 段${delivered.ok ? '' : `（发送失败：${delivered.error}）`}`);
       const head = delivered.ok
         ? '已发到群里。'
-        : `没能自动发出去（${delivered.error}），请你立刻用 send_message 把下面这段原样发到群里：\n${text}\n`;
+        : `没能自动发出去（${delivered.error}），请你立刻用 send_message 把下面这段发到群里。如果这段里有换行，先把换行去掉再发 —— 否则参数很容易不是合法 JSON：\n${text}\n`;
       return { content: `${head}\n当前存档：\n${cardText(active)}` };
     }
   });
