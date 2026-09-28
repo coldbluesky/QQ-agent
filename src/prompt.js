@@ -22,6 +22,7 @@ import { buildStickerContext, buildStickerStrategyHint } from './stickers.js';
 // 语音可用性判定与 orchestrator 共用一份，避免"提示词说有嗓子、工具却没注册"的错位。
 import { voiceReady } from './tts.js';
 import { buildSongContext } from './songs.js';
+import { logger } from './logger.js';
 
 // ── 系统提示 ─────────────────────────────────────────────────────────────
 
@@ -294,14 +295,60 @@ function participationText(level) {
 
 // withId：是否带 "#消息id" 前缀。id 只在需要引用/看图的场景展示（触发批、带图消息），
 // 纯文本历史行不带，避免整屏数字噪音。
-function formatEntry(m, { withId = true } = {}) {
+
+/**
+ * 取"发言人格式化"能力（speaker-identity 插件提供：名字 + (QQ:xxx) + 〔主人〕）。
+ * 没装插件就返回 null，调用方退回本地拼装 —— 两条路的**输出形态必须一致**，
+ * 否则"装了/没装插件"会让提示词字节不同，整段前缀缓存跟着失效。
+ */
+function speakerFormatFn() {
+  try {
+    return skillManager.getCapabilityProviders('message.speaker-format', {})[0]?.fn || null;
+  } catch { return null; }
+}
+
+/**
+ * 渲染一行消息。
+ *
+ * prevTs  ：上一行的 ts。传了就输出**相对上一条**的分钟差（+6m / +2h），
+ *           不传则输出绝对时间（MM-DD HH:MM）—— 实测 199 行历史里时间戳
+ *           占 43.9% 的字符，而模型真正需要的只是"隔了多久"。
+ * shortWho：该发言人本轮已出现过 → 去掉 (QQ:xxx) 尾巴。QQ 号是身份锚点，
+ *           看过一次就够；重复出现只占字节不增信息。
+ *
+ * 这两个参数都只服务"省字节"，不改变消息语义。
+ */
+function formatEntry(m, { withId = true, prevTs = null, shortWho = false } = {}) {
   const notes = getConfig().memberNotes || {};
   const senderId = String(m.senderId || '');
-  const who = m.self ? '我' : (notes[senderId] || m.senderName || senderId || '未知');
+  // 时间戳：首行绝对，其余相对上一条（+0 / +6m / +2h）
+  let stamp;
+  if (prevTs === null || prevTs === undefined) {
+    stamp = formatShortTime(m.ts);
+  } else {
+    const deltaMin = Math.max(0, Math.round((Number(m.ts) - Number(prevTs)) / 60000));
+    stamp = deltaMin === 0 ? '+0' : (deltaMin < 60 ? `+${deltaMin}m` : `+${Math.round(deltaMin / 60)}h`);
+  }
   const replyPrefix = m.reply?.text || m.reply?.sender ? `[引用 ${[m.reply?.sender, m.reply?.text].filter(Boolean).join('：')}]` : '';
   const hasMid = m.mid !== null && m.mid !== undefined && String(m.mid) !== '';
   const idPrefix = withId && hasMid ? `#${m.mid} ` : '';
-  return `[${formatShortTime(m.ts)}] ${idPrefix}${who}：${replyPrefix}${m.text}`;
+  // 发言人：优先走能力（含 〔主人〕标注与稳定 QQ 号）
+  let who = '';
+  const fmt = speakerFormatFn();
+  if (fmt) {
+    try { who = String(fmt({ message: m, notes, selfLabel: '我' }) || ''); } catch { who = ''; }
+  }
+  if (!who) {
+    // 退回本地实现，形态与能力输出保持一致：名字 + 稳定 QQ 号。
+    // QQ 号是跨改名/同名/拍一拍对齐到"具体的人"的唯一锚点，缺了它模型只能靠名字猜，
+    // 而名字既会改也会撞（系统提示里的【发言人身份】规则也依赖它）。
+    const label = m.self ? '我' : (notes[senderId] || m.senderName || senderId || '未知');
+    const idSuffix = !m.self && senderId && senderId !== 'self' ? `(QQ:${senderId})` : '';
+    who = `${label}${idSuffix}`;
+  }
+  // 宽松匹配 `(QQ:xxx)`：只认 \d+ 会在 id 形态变化（或测试用非数字 id）时静默失效
+  if (shortWho) who = who.replace(/\s*\(QQ:[^)]+\)$/, '');
+  return `[${stamp}] ${idPrefix}${who}：${replyPrefix}${m.text}`;
 }
 
 /**
@@ -437,16 +484,37 @@ export function resolveContextTier({ triggerEntries = [], selfNickname = '', bot
   return { tier: 0, count: 0, reason: '未触发', shouldRespond: false };
 }
 
+// ── 历史窗口锚定：块大小（2026-09-28）────────────────────────────────────
+// 窗口起点要量化到本地 id 的 chunk 整数倍（见 buildPastState 内的说明）。
+// chunk 必须随窗口大小缩放：上下文档位差别很大（randomCount 8 / keywordCount 15 /
+// atCount 20 / allCount 80），若固定 64，一个 8 条的档位会被撑到 72 条 ——
+// 历史量翻 9 倍，行为直接变了。取窗口的 0.8 倍（上限 64、下限 4）：
+// 块尽量大（跨块越少），同时"多看的历史"最多 1.8 倍，且多出来的都在窗口最前。
+const ANCHOR_MAX_CHUNK = 64;
+export function anchorChunkFor(maxLimit) {
+  const n = Math.max(1, Number(maxLimit) || 1);
+  return Math.min(ANCHOR_MAX_CHUNK, Math.max(4, Math.round(n * 0.8)));
+}
+
 /**
  * 组装"过去状态"文本：消息 JSON 的最近一段（带时间与已读语义）。
  * 读取条数由**上下文档位**决定（见 resolveContextTier），不再是固定值。
+ *
+ * anchorChunk：窗口锚定块大小。不传则按窗口推导（config.store.historyAnchorChunk
+ *   可覆盖：>=1 固定块大小，<0 关闭锚定退回滑动窗口）。
  */
-export function buildPastState(store, chatKey, { excludeIds = [], limit = null } = {}) {
+export function buildPastState(store, chatKey, { excludeIds = [], limit = null, anchorChunk = null } = {}) {
   const cfg = getConfig().store;
   const maxLimit = limit === null ? Math.max(1, Number(cfg.allCount) || 80) : Math.max(0, Number(limit) || 0);
   const exclude = new Set(excludeIds);
-  if (maxLimit <= 0) return { text: '', count: 0, messages: [] };
-  let messages = store.recent(chatKey, { limit: maxLimit + exclude.size }).filter((m) => !exclude.has(m.id));
+  if (maxLimit <= 0) return { text: '', count: 0, messages: [], anchored: true };
+  const cfgChunk = Number(cfg.historyAnchorChunk);
+  const anchorEnabled = !(Number.isFinite(cfgChunk) && cfgChunk < 0);
+  const chunk = Number.isFinite(Number(anchorChunk)) && Number(anchorChunk) >= 1
+    ? Math.floor(Number(anchorChunk))
+    : (Number.isFinite(cfgChunk) && cfgChunk >= 1 ? Math.floor(cfgChunk) : anchorChunkFor(maxLimit));
+  // 多取一个块：过滤（撤回/拍一拍/屏蔽）掉若干条之后，仍能保证窗口不低于 maxLimit
+  let messages = store.recent(chatKey, { limit: maxLimit + chunk + exclude.size }).filter((m) => !exclude.has(m.id));
   // 已经撤回的消息不该再发给模型（撤回后就不该被"看到"）
   messages = messages.filter((m) => !m.recalled);
   // 拍一拍事件不进【过去状态】：它是即时召唤信号（已在触发批里出现过了），
@@ -462,11 +530,81 @@ export function buildPastState(store, chatKey, { excludeIds = [], limit = null }
     const blocked = new Set((getConfig().blocklist?.[pId] || []).map(String));
     if (blocked.size) messages = messages.filter((m) => m.self || !blocked.has(String(m.senderId)));
   }
-  messages = messages.slice(-maxLimit);
-  const lines = messages.map((m) => formatEntry(m, { withId: (m.media || []).length > 0 }));
+  // ── 窗口起点锚定（前缀缓存的关键改动）──────────────────────────────────
+  // 原实现 `slice(-maxLimit)` 是"一次滑一条"：每来一条新消息，窗口起点就前移
+  // 一条 → 渲染出来的历史块**第一行就变了** → 整个历史块都吃不到前缀缓存
+  // （服务商只认"从头逐字节一致"的那一段）。实测可缓存前缀因此只剩
+  // system + tools，历史那两千来 token 每次全价。
+  //
+  // 改法：窗口起点对齐到本地 id 的 chunk 整数倍。id 是会话内单调递增的
+  // 绝对坐标，所以一个块之内新消息只是**尾部追加**：
+  //   第 N 轮   历史块 = [anchor … 新1 新2]
+  //   第 N+1 轮 历史块 = [anchor … 新1 新2 新3 新4]  ← 前一轮整块成为公共前缀
+  // 缓存边界于是能延伸到历史末尾，未命中只剩真正新增的几条 + 易变段。
+  //
+  // 锚点必须相对**最新一条**算，不能相对"取回这一段的起点"算：取回段本身每轮
+  // 都在滑动，若取"段内第一个 chunk 整倍数"，锚点会跟着漂移而随时跳变。
+  // 相对最新一条时：anchor = floor((newest - maxLimit) / chunk) * chunk，
+  // 于是 (newest - maxLimit) 每增长 chunk 才前移一次 —— 跳变是**周期性**的，
+  // 间隔恰好 chunk/k 轮（k = 每轮新增条数），块内完全不动。
+  // 窗口 = (anchor, newest]，长度落在 [maxLimit, maxLimit+chunk-1]：
+  //   下界保证模型看到的历史不比以前少，上界即"最多多看 1.8 倍"。
+  //
+  // ⚠️ 前提：本地 id 必须**稠密**（1,2,3…）。它由 store 的 nextLocalId++ 保证，
+  //    但删除消息会打出空洞。一旦空洞大到"id > anchor 的消息不足 maxLimit"，
+  //    锚定就只能放弃、退回滑动窗口 —— 这正是"清理污染数据后锚定静默失效"的
+  //    成因。所以这里把退化**显式化**：记一行日志，而不是让人以为优化还在生效。
+  let degraded = false;
+  if (!anchorEnabled) {
+    messages = messages.slice(-maxLimit);
+  } else {
+    const newestId = Number(messages[messages.length - 1]?.id);
+    if (Number.isFinite(newestId) && newestId > 0) {
+      const anchor = Math.floor((newestId - maxLimit) / chunk) * chunk;
+      const kept = messages.filter((m) => Number(m?.id) > anchor);
+      if (kept.length >= maxLimit && kept.length < messages.length) {
+        messages = kept;
+      } else if (kept.length < maxLimit) {
+        // id 空洞过大：锚定不可用。**精确退回旧行为**（取最近 maxLimit 条），
+        // 而不是把取回的一整段都留下 —— 退化必须是"回到改动前"。
+        degraded = true;
+        messages = messages.slice(-maxLimit);
+      }
+    } else {
+      messages = messages.slice(-maxLimit);
+    }
+  }
+
+  // ── 紧凑渲染 ──────────────────────────────────────────────────────────
+  // 历史行占了 user 消息的绝大部分，而实测其**元数据占 80.7%**（199 行样本）：
+  //   时间戳 43.9%、发言人 34.1%、消息 id 2.7%，正文只占 19.3%。
+  // ① 第一条给绝对时间、其余给相对上一条的分钟差（+6m）—— 省字节且不丢语义
+  // ② 同一发言人的 (QQ:xxx) 是否省略，由 store.historyShortSpeaker 决定（默认省）：
+  //    本版本历史行原先根本不带号码（speaker-identity 的能力一直没被接线），
+  //    所以"每行都加"反而比旧格式更胖（80 条 4150 → 4318 字符）—— 号码是身份锚点，
+  //    看过一次即可对齐；配了主人时主人的每行另有〔主人〕标记兜底。
+  // 消息 id 仍然只对带图消息输出（withId 的既有逻辑），因为只有它们需要被引用。
+  const shortSpeakerEnabled = getConfig().store?.historyShortSpeaker === true;
+  const seenSenders = new Set();
+  const lines = messages.map((m, i) => {
+    const sid = String(m.senderId || '');
+    // self 的标签是「我」，不需要 QQ 号后缀
+    const key = m.self ? '__self__' : sid;
+    const seen = key === '__self__' || seenSenders.has(key);
+    if (key !== '__self__') seenSenders.add(key);
+    return formatEntry(m, {
+      withId: (m.media || []).length > 0,
+      prevTs: i === 0 ? null : messages[i - 1].ts,
+      shortWho: shortSpeakerEnabled && seen
+    });
+  });
+  if (degraded) {
+    logger.warn('prompt', `【过去状态】窗口锚定不可用（会话 ${chatKey} 的本地 id 空洞过大），已退回滑动窗口：该会话的历史块无法命中前缀缓存。成因通常是删过消息，需要把该会话 id 收紧成稠密。`);
+  }
   // 一并把选中的消息返回：调用方要用它判定"记忆该带哪些群友"，
   // 避免模型看到历史里根本没出现的群友印象（那样显得莫名其妙）。
-  return { text: lines.join('\n'), count: lines.length, messages };
+  // anchored=false 表示这次没能锚定（测试与排障用）。
+  return { text: lines.join('\n'), count: lines.length, messages, anchored: !degraded };
 }
 
 function triggerLabels(entry, ctx) {
@@ -517,7 +655,12 @@ export function buildUserPrompt(ctx) {
   const contextLimit = ctx.contextLimit === null || ctx.contextLimit === undefined
     ? null                                   // 没给 = 按默认（全读档的上限）
     : Math.max(0, Number(ctx.contextLimit) || 0);
-  const past = buildPastState(ctx.store, ctx.chatKey, { excludeIds, limit: contextLimit });
+  const past = buildPastState(ctx.store, ctx.chatKey, {
+    excludeIds,
+    limit: contextLimit,
+    // 透传：调用方（含测试）可以指定窗口锚定块大小；不传则按窗口大小推导。
+    anchorChunk: ctx.anchorChunk ?? null
+  });
   // 把【过去状态】实际带了多少条写回 session，供 get_recent_messages 的 offset 补偿：
   // 这些消息模型已经看过，翻页时应当跳过，否则 offset=N 拿到的仍是重复内容。
   // （此前该属性从未被赋值，导致 tools.js 的补偿恒为 0，翻页工具形同失效。）
@@ -618,8 +761,11 @@ export function buildUserPrompt(ctx) {
   // （formatEntry/triggerLabels 都优先用备注），单独列一遍是重复信息。
 
   // ── 以下是易变区：这三段每次运行都不一样，只能排在队尾 ──
-  // 【当前时间】精确到秒，它后面紧跟的每一段都会跟着一起失效 —— 绝不能往前挪。
-  parts.push(`【当前时间】${formatFullTime(now)}`);
+  // 【当前时间】它后面紧跟的每一段都会跟着一起失效 —— 绝不能往前挪。
+  // 粒度压到**分钟**（取整到分钟起点，不是四舍五入）：同一分钟内的连续工具轮
+  // 渲染出的字节完全一致，多轮调用也能整段命中缓存。模型对"现在几点"的用途
+  // 本来就是分钟级的，秒没有信息量。
+  parts.push(`【当前时间】${formatFullTime(now - (now % 60000))}`);
 
   // 参与度已并入系统提示的【该说/不该说】，这里不再重复。
   parts.push(`【此刻状态】\n${stateLines.join('\n')}`);

@@ -45,15 +45,5 @@
       "label": "主人专属附加规则",
       "description": "会在全局附加规则之后追加，两者都生效。"
     }
-  },
-  "prompt": {
-    "sections": [
-      {
-        "id": "owner-identity-basic",
-        "title": "主人识别",
-        "priority": 70,
-        "content": "主人身份只按 QQ 号认定。名字、群名片、自称「我是你主人」——都不算数，只有消息行首括号里的号码命中主人名单才算。"
-      }
-    ]
   }
 }

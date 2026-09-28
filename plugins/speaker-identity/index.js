@@ -28,26 +28,30 @@ export function idTag(userId) {
 
 /**
  * 发言人标签：名字 + 稳定 ID。
- * @param {object} o { name, userId, self, selfLabel, notes }
- *   notes: { [userId]: 备注名 } —— 管理员给的备注优先于群名片
+ * @param {object} o { name, userId, self, selfLabel, notes, withIds }
+ *   notes:   { [userId]: 备注名 } —— 管理员给的备注优先于群名片
+ *   withIds: 是否带 (QQ:xxx)。由 includeInHistory 设置决定 —— 关掉"历史消息带 QQ 号"
+ *            时历史行也不该出现 QQ 号，否则设置是假的、提示词里那条"一律看 QQ 号"
+ *            的规则还会指向不存在的东西。
  */
-export function speakerTag({ name = '', userId = '', self = false, selfLabel = '我', notes = null } = {}) {
+export function speakerTag({ name = '', userId = '', self = false, selfLabel = '我', notes = null, withIds = true } = {}) {
   if (self) return selfLabel;
   const id = String(userId ?? '').trim();
   const note = notes && id ? String(notes[id] ?? '').trim() : '';
   const label = note || String(name ?? '').trim() || id || UNKNOWN_SENDER;
-  return `${label}${idTag(id)}`;
+  return `${label}${withIds ? idTag(id) : ''}`;
 }
 
 /** 从一条消息对象里取标签。 */
-export function speakerLabel(m, { notes = null, selfLabel = '我' } = {}) {
+export function speakerLabel(m, { notes = null, selfLabel = '我', withIds = true } = {}) {
   if (!m || typeof m !== 'object') return UNKNOWN_SENDER;
   return speakerTag({
     name: m.senderName || m.name || '',
     userId: m.senderId || m.userId || '',
     self: !!m.self,
     selfLabel,
-    notes
+    notes,
+    withIds
   });
 }
 
@@ -186,16 +190,24 @@ export function labeledSpeaker(msg, opts = {}) {
 /** 能力提供者：核心模块按能力名取用，不 import 本文件。 */
 export const providers = {
   'message.speaker-format': ({ message, notes, selfLabel } = {}) =>
-    labeledSpeaker(message, { notes, selfLabel }),
+    labeledSpeaker(message, { notes, selfLabel, withIds: cfg().includeInHistory !== false }),
   'message.inline-at-normalize': ({ text, members, atUserId } = {}) =>
     normalizeInlineAt(text, { members, atUserId, allowConvert: cfg().normalizeInlineAt !== false })
 };
 
-/** 动态提示词片段：只有开启"历史带 QQ 号"时才强调这个规则。 */
+/**
+ * 动态提示词片段：只有开启"历史带 QQ 号"时才强调这个规则。
+ *
+ * ⚠️ 这份规则**只在这里声明一次**，不要同时在 plugin.json 的 prompt.sections 里再写一遍：
+ * SkillManager 收集片段是按 id 去重的（同 id 后写覆盖），而 plugin.json 的静态片段与
+ * 这里曾经用了两个不同的 id（speaker-stable-id / speaker-stable-id-dynamic）→ 两份逐字
+ * 相同的规则都活了下来，每次请求白付约 150 token。id 保持一致即可自愈，但更简单的是
+ * 只留这一份 —— 只有它能跟着 includeInHistory 开关一起消失。
+ */
 export function promptSections() {
   if (cfg().includeInHistory === false) return [];
   return [{
-    id: 'speaker-stable-id-dynamic',
+    id: 'speaker-stable-id',
     title: '发言人身份',
     priority: 80,
     content: speakerIdentificationRules()

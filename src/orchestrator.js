@@ -30,6 +30,7 @@ import { parseTempCommand, setTempSetting, tempSettingsCfg } from './temp-settin
 // 把"写在正文里、但没通过工具发出去"的成稿抢救成一条 send_message 调用。
 // 判定逻辑本身是纯逻辑（可被测试直接驱动）；这里只负责注入依赖。
 import { rescueUnsentReply } from './reply-rescue.js';
+import { logger } from './logger.js';
 import { modelImageVerdict } from './vision-scan.js';
 import { currentProviders } from './providers.js';
 import { voiceReady } from './tts.js';
@@ -851,6 +852,20 @@ export class Orchestrator {
       session.model = response.model || session.model;
       addUsage(session.usage, response.usage);
       session.usage.calls += 1;
+
+      // 逐次缓存命中落一行日志（只记数值，不含任何聊天内容）。
+      // 这是唯一能看出"提示词前缀优化到底有没有生效"的观测点：同一会话里
+      // 第 1 次（冷启动）与第 2 次及以后（稳态）的差值极能说明问题 ——
+      // 用量页显示的是会话聚合值，把两者平均在一起，看不出结构好坏。
+      // 日常用机器人即可，过一段时间翻日志就能算真实命中率。
+      {
+        const u = response.usage || {};
+        const promptTok = Number(u.prompt_tokens) || 0;
+        const cachedTok = Number(u.prompt_tokens_details?.cached_tokens ?? u.prompt_cache_hit_tokens ?? u.cached_tokens) || 0;
+        if (promptTok > 0) {
+          logger.info('cache-stat', `${session.id} 第${session.usage.calls}次调用 prompt=${promptTok} cached=${cachedTok}（${Math.round((cachedTok / promptTok) * 100)}%）`);
+        }
+      }
 
       const msg = response.message;
       const finalContent = typeof msg.content === 'string' ? msg.content : (msg.content ?? null);

@@ -118,6 +118,12 @@ export const providers = {
   'model.thinking-detect': ({ baseUrl, model }) => detectDialect({ baseUrl, model })
 };
 
+/**
+ * 提示词片段：**只在这里声明一次**。
+ * 曾经 plugin.json 里还有一份 id 不同、标题同为「思考输出」的静态片段，
+ * 两份都漏进了系统提示（SkillManager 只按 id 去重）。这里那份还把"不要把打算、
+ * 分析写进要发送的消息里"这句并了进来 —— 合并后内容不减、token 减半。
+ */
 export function promptSections() {
   const req = resolveThinkingRequest();
   if (req.mode === 'off') return [];
@@ -125,7 +131,7 @@ export function promptSections() {
     id: 'thinking-active',
     title: '思考输出',
     priority: 30,
-    content: `当前思考模式：${req.mode}（${req.dialectLabel}）。思考内容不会发送给群友，只有调用发送工具才会真正发言。`
+    content: `当前思考模式：${req.mode}（${req.dialectLabel}）。思考内容不会发送给群友，只有调用发送工具才会真正发言，也不要把打算、分析写进要发送的消息里。`
   }];
 }
 

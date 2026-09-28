@@ -37,15 +37,5 @@
       "label": "思考预算（token）",
       "description": "仅支持 budget 的渠道（Claude 兼容、部分网关）生效。0 = 不指定。"
     }
-  },
-  "prompt": {
-    "sections": [
-      {
-        "id": "thinking-note",
-        "title": "思考输出",
-        "priority": 30,
-        "content": "你的思考内容不会发送给群友，只有调用发送工具才会真正发言。不要把打算、分析写进要发送的消息里。"
-      }
-    ]
   }
 }
