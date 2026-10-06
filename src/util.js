@@ -193,6 +193,39 @@ export function toFileUri(input) {
   return unc ? 'file://' + encoded : 'file:///' + encoded;
 }
 
+/**
+ * file URI / 裸路径 → 本地文件路径（`toFileUri` 的逆）。**全项目唯一实现**。
+ *
+ * 为什么需要它：协议端读不到我们给的路径时（不同机/不同容器），机器人得**自己**
+ * 把文件读出来转 base64 内联 —— 那一步的前提就是先把 URI 还原成路径。
+ * 各处再手搓一遍 `slice(7)` 必然重演 toFileUri 注释里那段四个斜杠的历史。
+ *
+ * 覆盖四种输入（与 toFileUri 的产出、以及历史脏数据对应）：
+ *   file:///opt/x       → /opt/x          （POSIX）
+ *   file:///D:/x        → D:/x            （Windows：URL pathname 会多一个前导斜杠）
+ *   file:////opt/x      → /opt/x          （历史脏数据，四个斜杠）
+ *   file://server/share → //server/share  （UNC host 形式）
+ * 不含协议头的裸路径原样返回（调用方一套代码就能处理两种输入）；
+ * 空值/解析不出来返回 ''，调用方据此走"发不出去"的报错分支。
+ */
+export function fromFileUri(ref) {
+  const raw = String(ref ?? '').trim();
+  if (!raw) return '';
+  if (raw.slice(0, 7).toLowerCase() !== 'file://') return raw;   // 已是裸路径
+  let url;
+  try { url = new URL(raw); } catch { return ''; }
+  let pathname;
+  try { pathname = decodeURIComponent(url.pathname); } catch { pathname = url.pathname; }
+  // 四个斜杠的历史数据：先收敛前导斜杠（细节见 toFileUri 的注释）
+  pathname = pathname.replace(/^\/+/, '/');
+  // host 形式（UNC）：URL 把 server 放进了 hostname，这里补回去
+  const host = String(url.hostname || '');
+  if (host && host !== 'localhost') return `//${host}${pathname}`;
+  // Windows：/D:/x → D:/x
+  if (/^\/[A-Za-z]:[\\/]/.test(pathname)) pathname = pathname.slice(1);
+  return pathname;
+}
+
 /** 简易事件总线。 */
 export function createEventBus() {
   const listeners = new Map();

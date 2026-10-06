@@ -10,7 +10,7 @@
  * 这里保留 re-export 只是为了不破坏既有引用。
  */
 import { getConfig, DEFAULT_CONFIG } from './config.js';
-import { sleep, randInt, createSendChain, escapeCqText, formatClockTime, toFileUri } from './util.js';
+import { sleep, randInt, createSendChain, escapeCqText, formatClockTime, toFileUri, fromFileUri } from './util.js';
 import { mdToPlain, splitForQQ } from './md-to-plain.js';
 // 音频文件要转成协议端认识的形式（file:// URI / 裸路径 / base64）才能发
 import { voiceFileParam } from './tts.js';
@@ -24,9 +24,38 @@ export { toFileUri };
 const DEFAULT_MAX_PER_MINUTE = DEFAULT_CONFIG.send.maxPerMinute;
 const DEFAULT_MAX_PER_HOUR = DEFAULT_CONFIG.send.maxPerHour;
 
-// 本地表情文件转 base64 内联的体积上限：base64 会膨胀约 1/3，再大就走 WebSocket
-// 容易把协议端拖垮。超过就明确报错，而不是发出去卡死。
-const MAX_INLINE_STICKER_BYTES = 10 * 1024 * 1024;
+// 本地文件转 base64 内联的体积上限：base64 会膨胀约 1/3，HTTP body 一大就容易撞
+// 协议端的超时（实测 1.9MB 的图 base64 后 2.5MB，15 秒窗口经常走不完）。
+// 表情与图片共用同一条约束 —— 同一层协议、同一类风险，别各留一个数。
+const MAX_INLINE_BYTES = 10 * 1024 * 1024;
+
+/**
+ * 本地图片 → `base64://` 内联引用（协议端读不到该路径时的回退）。
+ *
+ * 返回 null = 这条路走不通（没有路径 / 文件不在本机 / 空文件），由调用方决定怎么报错；
+ * **体积超限则直接抛错** —— 那种情况的处置方式完全不同（换小图 / 让协议端挂载同一目录），
+ * 含糊地"再失败一次"只会让用户以为还是路径问题。
+ */
+function inlineImageRef(file, log = null) {
+  const local = fromFileUri(file);
+  if (!local) return null;
+  let buf;
+  try {
+    buf = fs.readFileSync(local);
+  } catch (error) {
+    log?.(`读本地图片失败（${local}）：${error?.code ?? error?.message ?? error}`);
+    return null;
+  }
+  if (!buf.length) return null;
+  if (buf.length > MAX_INLINE_BYTES) {
+    throw new Error(
+      `图片 ${(buf.length / 1024 / 1024).toFixed(1)}MB，超过内联上限 `
+      + `${Math.round(MAX_INLINE_BYTES / 1024 / 1024)}MB，无法转 base64 发送；`
+      + `请让协议端能访问 ${local}（不同容器/不同机时挂载同一个目录），或改用更小的图`
+    );
+  }
+  return `base64://${buf.toString('base64')}`;
+}
 
 export class SendQueue {
   constructor({ onebot, store, onSent = null, log = null }) {
@@ -222,10 +251,10 @@ export class SendQueue {
           if (!local) throw firstError;
           const buf = fs.readFileSync(local);
           if (!buf.length) throw firstError;
-          if (buf.length > MAX_INLINE_STICKER_BYTES) {
+          if (buf.length > MAX_INLINE_BYTES) {
             throw new Error(
               `表情本地图片 ${(buf.length / 1024 / 1024).toFixed(1)}MB，超过内联上限 `
-              + `${Math.round(MAX_INLINE_STICKER_BYTES / 1024 / 1024)}MB 无法发送；`
+              + `${Math.round(MAX_INLINE_BYTES / 1024 / 1024)}MB 无法发送；`
               + `请确认协议端能访问 ${local}`
             );
           }
@@ -342,14 +371,41 @@ export class SendQueue {
           atUserId: options.atUserId ?? null
         });
       } catch (error) {
-        // file:// 失败 → 回退 base64（协议端不同机、路径不可读、权限不足等）。
-        // 只在**有 dataUrl 备份**且**确实是 local 路径**时才回退，避免无意义重试。
-        if (!file || !dataUrl) throw error;
-        this.log?.(`本地路径发送失败（${error?.message ?? error}），回退 base64 重试一次`);
-        data = await this.onebot.sendImage(kind, id, dataUrl, {
-          replyToMessageId: options.replyToMessageId ?? null,
-          atUserId: options.atUserId ?? null
-        });
+        // ── file:// 失败 → 改走 base64 内联 ─────────────────────────────
+        // 触发场景（实测）：协议端与机器人不在同一个文件系统里 —— SnowLuma 跑在
+        // Docker / 另一台机器上，机器人在宿主机或 WSL 里；机器人给的
+        // file:///tmp/qq-agent-image-generate/xxx.jpg 协议端一律 ENOENT
+        // （报错原文：send_private_msg 失败: retcode=200 ENOENT ... open '/tmp/...'）。
+        //
+        // ⚠️ 两条来源，缺一不可：
+        //   1) 调用方额外备好的 dataUrl（图搜/媒体下载这条线可能有）
+        //   2) **机器人自己读盘**转 base64 —— 文生图这类链路手里只有本地路径，
+        //      原先没有兜底，于是"图画出来了却发不出去"成了死路。
+        //      表情那条链早就这么修过，图片这边漏了。
+        const fromCaller = Boolean(dataUrl);
+        const inline = fromCaller ? dataUrl : inlineImageRef(file, this.log);
+        if (!inline) {
+          // 两条路都不通：把"为什么"写清楚，而不是把协议端的裸 ENOENT 丢给模型。
+          // 「机器人侧也读不到」= 文件被清理/路径本来就错；
+          // 「机器人侧读得到」= 文件没问题，纯粹是协议端看不见这个路径。
+          const local = fromFileUri(file);
+          const hint = file
+            ? `（机器人侧${local && fs.existsSync(local) ? '能读到' : '也读不到'} ${local || file}；`
+              + `协议端与机器人不同机/不同容器时，需要共享目录或让它自己下载）`
+            : '';
+          throw new Error(`图片发送失败：${error?.message ?? error}${hint}`);
+        }
+        this.log?.(fromCaller
+          ? `本地路径发送失败（${error?.message ?? error}），回退调用方给的 dataUrl 重试一次`
+          : `本地路径发送失败（${error?.message ?? error}），已读本地文件转 base64 内联重发`);
+        try {
+          data = await this.onebot.sendImage(kind, id, inline, {
+            replyToMessageId: options.replyToMessageId ?? null,
+            atUserId: options.atUserId ?? null
+          });
+        } catch (inlineError) {
+          throw new Error(`图片改用 base64 内联后仍发送失败：${inlineError?.message ?? inlineError}`);
+        }
       }
       this.#markSent(chatKey, `__img__${dedupeKey}`);   // 发图同样：成功后才记账
       const ts = Date.now();

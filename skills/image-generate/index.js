@@ -364,7 +364,14 @@ export async function generate(s, { prompt, size, extra = {} } = {}) {
 
 /** 生成的图片先落到临时目录，再交给 sender 走发送管道（sender 会负责转存/引用）。 */
 function tempImagePath(ext) {
-  const dir = path.join(os.tmpdir(), 'qq-agent-image-generate');
+  // ⚠️ 必须钉成**绝对路径**。os.tmpdir() 在某些环境里返回 POSIX 风格的 '/tmp'
+  //    （Windows 上 TMPDIR/TEMP 被设成 '/tmp' 时就会这样），而它是**驱动器相对**的：
+  //    机器人与协议端各自按自己的工作盘解析，可能落到不同盘 —— 谁都找不到那个文件，
+  //    表现为协议端 open('/tmp/qq-agent-image-generate/…') 报 ENOENT。
+  //    path.resolve 把它固定成本进程视角的绝对路径（'D:\tmp\…' / '/tmp/…'）。
+  // 注：路径最终能不能被协议端读到，由 src/sender.js 的 base64 回退兜底
+  //    （不同容器/不同机时协议端读不到任何本地路径）。
+  const dir = path.resolve(os.tmpdir(), 'qq-agent-image-generate');
   fs.mkdirSync(dir, { recursive: true });
   return path.join(dir, `gen-${Date.now()}-${Math.random().toString(36).slice(2, 8)}${ext}`);
 }
