@@ -460,6 +460,9 @@ async function loadSkillRoot(rootDir, { log = console.log, label = 'skill' } = {
   }
   const dirs = fs.readdirSync(rootDir, { withFileTypes: true })
     .filter((e) => e.isDirectory())
+    // 跳过隐藏目录：zip 安装中途的临时目录（.install-*，进程被 kill 时可能残留）
+    // 与编辑器/系统垃圾都不该被当成模块加载 —— 否则日志里会冒出一条看不懂的加载失败。
+    .filter((e) => !e.name.startsWith('.'))
     .map((e) => path.join(rootDir, e.name));
   if (!dirs.length) {
     log(`[${label}] ${path.basename(rootDir)}/ 为空：${rootDir}`);
