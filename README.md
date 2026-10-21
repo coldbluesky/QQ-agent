@@ -93,7 +93,7 @@ plugins/my-plugin/            skills/my-skill/
 ## 安装与使用
 **三步搞定**（推荐）：
 ```bash
-git clone https://github.com/Kondius/qq-agent.git
+git clone https://github.com/K0nd1us/QQ-agent.git
 cd qq-agent
 npm install
 npm run setup    # 自动下载 SnowLuma + 固定版本便携 QQ
