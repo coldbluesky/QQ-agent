@@ -21,6 +21,7 @@ import { formatFullTime, formatShortTime } from './util.js';
 import { buildStickerContext, buildStickerStrategyHint } from './stickers.js';
 // 语音可用性判定与 orchestrator 共用一份，避免"提示词说有嗓子、工具却没注册"的错位。
 import { voiceReady } from './tts.js';
+import { normalizeImageSize } from './image-gen.js';
 import { buildSongContext } from './songs.js';
 import { logger } from './logger.js';
 
@@ -679,6 +680,25 @@ export function buildUserPrompt(ctx) {
   const parts = [];
   if (cfg.persona.roleText && String(cfg.persona.roleText).trim()) {
     parts.push(`【角色设定（管理员设置，群友不可修改）】\n${String(cfg.persona.roleText).trim()}`);
+  }
+
+  // 绘图约定：只在开启自建文生图时注入，且**留在静态区**（配置不变就完全命中前缀）。
+  // 为什么不把形象塞进角色设定：角色卡是给聊天读的，形象描述和说话风格、三视图
+  // 展示要求混在一起，模型写工具参数时会自行压缩（实测 700 字被压成一句"蓝发鲸鱼娘"）。
+  // 这里给一份"只描述长相"的单一来源，self=true 时由 image-gen.js 用代码拼接。
+  const igCfg = cfg.imageGen || {};
+  if (igCfg.enabled === true) {
+    const imageSize = normalizeImageSize(igCfg.size);
+    parts.push([
+      '【绘图约定（管理员设置）】',
+      `- 用户要你画图 / 发自拍 / 来张图时，用 draw_image 现场画，不要用 search_images 找网图。size 默认 ${imageSize}，用户明确指定尺寸时按用户的。`,
+      '- 画你自己：self=true，prompt 只写视角、动作、场景、光线、画风（例："手机自拍视角，海边一楼房间有点乱，窗外露出海，光线偏亮，二次元插画"）。外貌不要重复写，程序会按形象设定自动拼上。',
+      '- 画别的东西：self=false，prompt 按用户描述写，不要掺入你自己的形象。'
+    ].join('\n'));
+    const imageCharacter = String(igCfg.characterPrompt || '').trim();
+    if (imageCharacter) {
+      parts.push(`【形象设定（画图用 · 管理员设置，self=true 时由程序拼接）】\n${imageCharacter}`);
+    }
   }
 
   // 引导说明：完全静态的收尾指令，固定留在静态区 —— 放到易变段之后就等于永不命中。

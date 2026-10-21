@@ -114,7 +114,7 @@ try {
     'renderMemorySettingsSection', 'renderPersonaSection', 'renderAllowSection',
     'renderChatSection', 'renderDesktopSection', 'renderOnebotSection',
     'renderToolsSection', 'renderPortedSettingsSection', 'renderSecuritySection',
-    'renderPersonaPicker', 'renderHealthCard'
+    'renderMediaSection', 'renderPersonaPicker', 'renderHealthCard'
   ];
 
   // 直接用后端的 DEFAULT_CONFIG 做桩 —— 不要手敲字段名，
@@ -228,6 +228,46 @@ try {
   } catch (e) {
     fail++;
     console.log('  FAIL 语音分区抛错: ' + (e && e.message));
+  }
+
+  // ── 图片 / 视频分区（图片输入 + 视频 + 自建文生图 + 发网图）──
+  console.log('\n=== 图片 / 视频分区 ===');
+  try {
+    // 1) 侧边栏切到 media 后要真的渲染出这一栏
+    vm.runInContext("state.settingsSection = 'media';", ctx);
+    const mediaHtml = String(ctx.renderSettingsSection(cfg));
+    const okDispatch = mediaHtml.includes('id="settings-media"') && mediaHtml.includes('cfg-imggen-enabled');
+    okDispatch ? pass++ : fail++;
+    console.log('  ' + (okDispatch ? 'OK   ' : 'FAIL ') + '切到 media 分区后渲染出图片 / 视频设置');
+    if (!okDispatch) console.log('    [调试] ' + JSON.stringify(mediaHtml.slice(0, 200)));
+
+    // 2) 关键控件齐全
+    const neededMedia = [
+      'cfg-vision', 'cfg-vision-model', 'cfg-video-model', 'cfg-video-mode', 'cfg-video',
+      'cfg-imggen-enabled', 'cfg-imggen-provider', 'cfg-imggen-model', 'cfg-imggen-baseurl',
+      'cfg-imggen-apikey', 'cfg-imggen-size', 'cfg-imggen-count', 'cfg-imggen-character',
+      'imggen-test-btn', 'imggen-test-preview',
+      'cfg-imgsend-enabled', 'cfg-imgsend-max', 'cfg-imgsend-maxmb'
+    ];
+    const missingMedia = neededMedia.filter((id) => !mediaHtml.includes(`id="${id}"`));
+    missingMedia.length === 0 ? pass++ : fail++;
+    console.log('  ' + (missingMedia.length === 0 ? 'OK   ' : 'FAIL ') + '关键控件齐全'
+      + (missingMedia.length ? ' -> 缺 ' + missingMedia.join(', ') : ''));
+
+    // 3) 已从「模型 API」「安全与限制」里搬干净：同批 id 不能在两个分区重复渲染
+    const apiAfter = String(ctx.renderApiSection(cfg));
+    const secAfter = String(ctx.renderSecuritySection(cfg));
+    const dup = ['cfg-vision', 'cfg-vision-model', 'cfg-video-model', 'cfg-video-mode', 'cfg-video']
+      .filter((id) => apiAfter.includes(`id="${id}"`))
+      .concat(['cfg-imgsend-enabled', 'cfg-imgsend-preview'].filter((id) => secAfter.includes(`id="${id}"`)));
+    dup.length === 0 ? pass++ : fail++;
+    console.log('  ' + (dup.length === 0 ? 'OK   ' : 'FAIL ') + '「模型 API」「安全与限制」里已无图片/视频控件'
+      + (dup.length ? ' -> 残留 ' + dup.join(', ') : ''));
+
+    vm.runInContext("state.settingsSection = 'api';", ctx);
+  } catch (e) {
+    fail++;
+    console.log('  FAIL 图片 / 视频分区抛错: ' + (e && e.message));
   }
 
   // ── 记忆整理 / 前情摘要分区 ──

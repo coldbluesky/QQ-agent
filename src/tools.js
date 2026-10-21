@@ -15,6 +15,7 @@ import { skillManager } from './skills/manager.js';
 import { expandForwardNodes } from './onebot.js';
 import { registerTool, listTools } from './tool-registry.js';
 import { registerPortedTools } from './tools-ported.js';
+import { generateImage, imageGenReady } from './image-gen.js';
 
 async function downloadImageAsDataUrl(url, timeoutMs = 30000) {
   const safeUrl = await validateImageUrl(url);
@@ -854,6 +855,70 @@ const BUILTIN_TOOL_DEFS = [
           note = `今天不是节日，未来 ${days} 天内也没有常见节日。`;
         }
         return ok({ ...out, note });
+      }
+    },
+    // ── 自绘（自建文生图，替代市场里的 image-generate 插件）──
+    {
+      name: 'draw_image',
+      category: 'media',
+      icon: '🎨',
+      defaultEnabled: true,
+      description: '现场画一张图并发到当前聊天（不是搜网图）。用户说"画一张""发张自拍""给我画个…"时用它。'
+        + '画你自己时把 self 设为 true：prompt 只写镜头/动作/场景/光线/画风，外貌（发型发色、服饰、尾巴、鞋袜）由程序按【形象设定】自动拼上，不要重复描述，也不要用"蓝发鲸鱼娘"这种概括代替。',
+      parameters: {
+        type: 'object',
+        properties: {
+          prompt: { type: 'string', description: '画面描述：视角（如手机自拍视角）、动作、场景、光线、画风。self=true 时不要写外貌' },
+          self: { type: 'boolean', description: 'true = 画你自己（自动拼上形象设定）；false 或省略 = 画别的东西' },
+          size: { type: 'string', description: '可选：尺寸 WxH（如 1024x1024）；留空用设置页的默认尺寸' },
+          note: { type: 'string', description: '可选：配一句话一起发' },
+          replyToMessageId: { type: ['integer', 'string'], description: '可选：引用某条消息的 id' },
+          atUserId: { type: ['integer', 'string'], description: '可选：@ 某人（填 QQ 号）' }
+        },
+        required: ['prompt']
+      },
+      async execute(ctx, args) {
+        try {
+          const ready = imageGenReady();
+          if (!ready.ok) {
+            return err(`自建绘图还没配好（缺 ${ready.missing.join('、')}）。请管理员到设置页「图片 / 视频 → 文生图」补齐后再画。`);
+          }
+          const cfg = getConfig();
+          // 出图比找图慢也更容易刷屏，沿用 send_image 的每轮上限
+          const opt = cfg.security?.imageSend || {};
+          ctx.drawState = ctx.drawState || { count: 0 };
+          const max = Math.max(1, Number(opt.maxPerRun) || 3);
+          if (ctx.drawState.count >= max) {
+            return err(`本次运行已经画了 ${ctx.drawState.count} 张，达到上限（设置 → 图片 / 视频 里可调）。`);
+          }
+          const prompt = String(args.prompt ?? '').trim();
+          if (!prompt) return err('prompt 不能为空：至少写清视角、动作和场景。');
+
+          const self = args.self === true;
+          const result = await generateImage({ prompt, self, size: args.size });
+          const img = result.images[0];
+          const sent = await ctx.sender.sendImage(ctx.chatKey, { file: img.file }, {
+            note: args.note,
+            replyToMessageId: args.replyToMessageId ?? null,
+            atUserId: args.atUserId ?? null
+          });
+          ctx.drawState.count += 1;
+          ctx.session.sent.push({
+            type: 'image',
+            text: `[自绘${self ? '自拍' : '图片'}${args.note ? `:${String(args.note).slice(0, 40)}` : ''}]`,
+            at: new Date().toLocaleTimeString('zh-CN', { hour12: false })
+          });
+          ctx.emit('session-update', ctx.session.id);
+          return ok({
+            sent: true,
+            messageId: sent?.message_id ?? null,
+            size: result.size,
+            model: result.model,
+            note: '图画好并发出了。不要在回复里再描述画面细节，像发照片一样随口说一句就行。'
+          });
+        } catch (error) {
+          return err(error?.message ?? error);
+        }
       }
     },
     // ── 发网图 / 搜网图 ──

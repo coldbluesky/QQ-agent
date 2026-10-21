@@ -107,8 +107,27 @@ export const DEFAULT_CONFIG = {
       endpoint: ''           // 留空 = https://tts.tencentcloudapi.com（一般不用改）
     }
   },
-  // 多提供商模型目录（设置页手动维护）
-  providers: [],
+  // 文生图（自建）。OpenAI 兼容的 POST {baseUrl}/images/generations。
+  // 开启且字段齐全时模型才会拿到 draw_image 工具（见 orchestrator 的工具过滤）。
+  // 不再依赖市场里的 image-generate 插件：角色外貌由代码拼进 prompt（characterPrompt），
+  // 模型只写镜头/动作/场景，避免它把 700 字人设压成一句"蓝发鲸鱼娘"。
+  imageGen: {
+    enabled: false,          // 关 = 移除 draw_image 工具
+    provider: '',            // 复用「模型目录」里的提供商 id；留空则退回聊天模型的地址与 Key
+    baseUrl: '',             // 留空 = 用 provider 的地址，再退回 api.baseUrl（应填到 /v1 为止）
+    apiKey: '',              // 留空 = 用 provider 的 Key，再退回当前聊天模型的 Key
+    model: '',               // 绘图模型 id，如 gpt-image-1 / doubao-seedream-4-0 / flux-1.1-pro（必填才会启用）
+    size: '1024x1024',       // 默认尺寸 WxH；用户明确指定尺寸时以用户的为准
+    count: 1,                // 一次生成几张（1~4）
+    quality: '',             // 可选，透传给接口（如 high / medium / low），留空不发
+    style: '',               // 可选，透传给接口（DALL·E 系的 vivid / natural），留空不发
+    responseFormat: '',      // 可选，'b64_json' / 'url'；留空不发（很多中转站对未知字段直接 400）
+    timeoutMs: 120000,       // 出图普遍比聊天慢，默认给 2 分钟
+    keepFiles: 50,           // data/images/ 本地图片保留个数；0 = 不限制
+    // 画图用的【形象设定】：只写长相与穿着，self=true 时被原样垫在 prompt 前面。
+    // 留空 = 不拼接，全靠模型自己描述外貌（会压缩、会走形，不推荐）。
+    characterPrompt: ''
+  },
   // 多提供商模型目录（设置页手动维护）
   providers: [],
   dshProviderKeys: {},   // providerId -> 真实 API Key（providers[] 里不再存明文 Key）

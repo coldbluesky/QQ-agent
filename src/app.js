@@ -33,6 +33,7 @@ import { importFromDsh, currentProviders, setProviderKey, testAllProviders, test
 import { scanModelsVision, visionResults, modelImageVerdict } from './vision-scan.js';
 import { builtinVisionResults } from './model-vision-docs.js';
 import { speak, testVoice } from './tts.js';
+import { testImageGen } from './image-gen.js';
 import { loadSummary, saveSummary, clearSummary, pickMessagesToFold, resolveKeepRaw } from './summary.js';
 import { loadSongLibrary, songsStatus, SONGS_DIR } from './songs.js';
 import { createEventBus, todayKey } from './util.js';
@@ -1141,6 +1142,22 @@ export function createApp({ log = console.log } = {}) {
         const text = String(body?.text ?? '').trim() || '你好，我是小鲸鱼，这是一条测试语音。';
         const overrides = body?.overrides && typeof body.overrides === 'object' ? body.overrides : {};
         const result = await testVoice(text.slice(0, 100), overrides);
+        return json(res, 200, { ok: true, result });
+      }
+
+      // ── 自建文生图：控制台「测试出图」──
+      // 与语音同口径：界面上的未保存值当 overrides 传，空串/掩码不算覆盖。
+      // 返回 data URL 直接预览，省得用户先去 QQ 里试。
+      if (pathname === '/api/image-gen/test' && method === 'POST') {
+        const body = await readBody(req).catch(() => ({}));
+        const prompt = String(body?.prompt ?? '').trim();
+        const overrides = body?.overrides && typeof body.overrides === 'object' ? body.overrides : {};
+        const result = await testImageGen({
+          prompt: prompt || '手机自拍视角，窗边，光线偏亮',
+          self: body?.self === true,
+          size: String(body?.size ?? '').trim(),
+          overrides
+        });
         return json(res, 200, { ok: true, result });
       }
 

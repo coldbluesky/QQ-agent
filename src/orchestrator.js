@@ -34,6 +34,7 @@ import { logger } from './logger.js';
 import { modelImageVerdict } from './vision-scan.js';
 import { currentProviders } from './providers.js';
 import { voiceReady } from './tts.js';
+import { imageGenReady } from './image-gen.js';
 import { loadSongLibrary, songsStatus } from './songs.js';
 import {
   loadSummary, saveSummary, clearSummary,
@@ -773,6 +774,9 @@ export class Orchestrator {
     // 语音：开关打开、真的注入了合成器、且配置完整（选好模型/凭证）才给工具。
     // 少了任一条件都不注册 —— 否则模型每次调用都撞一个必然失败的报错，白烧 token。
     const voiceEnabled = cfg.voice?.enabled === true && Boolean(this.tts) && voiceReady().ok;
+    // 自建文生图：开关 + 接口字段齐全才注册 draw_image。缺字段时模型会反复调一个
+    // 必然失败的工具，白烧 token（与 voice 同一套判断口径）。
+    const imageGenEnabled = cfg.imageGen?.enabled === true && imageGenReady().ok;
     // 曲库：开关 + 有歌 + 装了 ffmpeg 三者齐备才注册 sing / list_songs。
     // 缺 ffmpeg 是最容易踩的（它是个系统依赖），这里判掉能让模型完全不知道有唱歌这回事。
     const songState = songsStatus(songEntries);
@@ -782,6 +786,7 @@ export class Orchestrator {
       if (!visionEnabled && (d.name === 'get_message_images' || d.name === 'get_sticker_image')) return false;
       if (!searchEnabled && (d.name === 'web_search' || d.name === 'web_fetch')) return false;
       if (!voiceEnabled && d.name === 'send_voice') return false;
+      if (!imageGenEnabled && d.name === 'draw_image') return false;
       if (!songState.ok && (d.name === 'sing' || d.name === 'list_songs')) return false;
       // Skill 层（统一口径）：所属技能是否生效 / 能力依赖 / 分类开关 / 单工具开关 / tool.guard
       const av = getToolAvailability(d.id ?? d.name, {

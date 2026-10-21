@@ -2784,6 +2784,7 @@ function renderSettingsSidebar() {
   const menu = [
     ['api', '模型 API'],
     ['voice', '语音输出'],
+    ['media', '图片 / 视频'],
     ['search', '搜索服务'],
     ['memory', '记忆'],
     ['persona', '人设'],
@@ -2838,6 +2839,7 @@ function renderSettingsSection(c) {
   const sections = {
     api: () => renderApiSection(c),
     voice: () => renderVoiceSection(c),
+    media: () => renderMediaSection(c),
     search: () => renderSearchSection(c),
     memory: () => renderMemorySettingsSection(c),
     persona: () => renderPersonaSection(c),
@@ -2979,14 +2981,111 @@ function renderPortedSettingsSection(c) {
     </div>`;
 }
 
-// ── 安全与限制 ───────────────────────────────────────────────────────────
-function renderSecuritySection(c) {
+// ── 图片 / 视频 ───────────────────────────────────────────────────────────
+// 单独成栏（而不是散落在「模型 API」和「安全与限制」里）：
+//   看图（图片输入）、看视频、发网图、自建文生图，是四条各自独立的链路，
+//   各自有自己的模型、开关与限制。集中在一处才好排查"为什么它不发图/看不到图"。
+function renderMediaSection(c) {
+  const api = c.api || {};
+  const g = c.imageGen || {};
   const sec = c.security || {};
   const img = sec.imageSend || {};
-  const lock = sec.browseLock || {};
-  const hosts = Array.isArray(lock.hosts) ? lock.hosts.join('\n') : '';
+  const providers = state.providers || [];
+  const missing = [];
+  if (!String(g.model || '').trim()) missing.push('绘图模型');
+  if (!String(g.baseUrl || '').trim() && !String(g.provider || '').trim()) missing.push('接口地址');
+  if (!g.hasApiKey && !String(g.apiKey || '').trim()) missing.push('API Key');
   return `
-    <h3 id="settings-security">安全与限制</h3>
+    <h3 id="settings-media">图片 / 视频</h3>
+    <div class="hint" style="margin-bottom:10px">这里管四件事：<b>看图</b>（图片输入）、<b>看视频</b>、<b>发网图</b>、<b>自己画图</b>。各自独立开关，互不影响。</div>
+
+    <h3>图片输入（看图）</h3>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-vision" ${api.vision !== false ? 'checked' : ''} />
+      <label for="cfg-vision">图片输入（关闭则移除看图工具，模型只会看到 [图片] 占位符）</label>
+      <span id="vision-switch-hint" class="muted" style="font-size:12px;align-self:center"></span></div>
+    <div class="field-row">
+      <div class="field"><label>图片输入专用模型（留空 = 用主模型）</label>
+        <input type="text" id="cfg-vision-model" value="${esc(api.visionModel || '')}" placeholder="只在真的要「看图」时才切过去" /></div>
+      <div class="field"><label>视频输入专用模型（留空 = 用主模型）</label>
+        <input type="text" id="cfg-video-model" value="${esc(api.videoModel || '')}" placeholder="全模态模型" /></div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>视频读取模式</label>
+        <select id="cfg-video-mode">
+          ${[['auto', '自动：配了视频专用模型就原生读，否则抽帧'], ['native', '强制原生视频输入'], ['frames', '强制抽帧截图'], ['off', '关闭画面（只给元信息）']]
+            .map(([v, t]) => `<option value="${v}" ${String(api.videoMode || 'auto') === v ? 'selected' : ''}>${t}</option>`).join('')}
+        </select></div>
+    </div>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-video" ${api.video === true ? 'checked' : ''} />
+      <label for="cfg-video">当前模型支持视频输入（勾了才会把视频/GIF 当作 video 部件发给模型）</label></div>
+
+    <div class="settings-divider"></div>
+
+    <h3>文生图（自建，不依赖插件）</h3>
+    <div class="hint" style="margin-bottom:10px">
+      开启后模型会拿到 <code>draw_image</code> 工具，能现场画图并发出来（不是搜网图）。接口按 OpenAI 兼容的
+      <code>POST {baseUrl}/images/generations</code> 调用。相比市场里的绘图插件，这里的<b>角色形象由程序拼进 prompt</b>：
+      模型只写镜头/动作/场景，外貌不可能被它压缩成一句"蓝发鲸鱼娘"。
+    </div>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-imggen-enabled" ${g.enabled === true ? 'checked' : ''} />
+      <label for="cfg-imggen-enabled">允许模型自己画图（关闭则移除 draw_image 工具）</label>
+      <span id="imggen-switch-hint" class="muted" style="font-size:12px;align-self:center">${missing.length ? `还缺：${missing.join('、')}` : ''}</span></div>
+
+    <div class="field-row">
+      <div class="field"><label>复用模型提供商</label>
+        <select id="cfg-imggen-provider">
+          <option value="" ${!g.provider ? 'selected' : ''}>不使用目录（用聊天模型的地址与 Key）</option>
+          ${providers.map((p) => `<option value="${esc(p.id)}" ${g.provider === p.id ? 'selected' : ''}>${esc(p.displayName || p.id)}</option>`).join('')}
+        </select>
+        <div class="hint">选中后自动用该提供商的地址与 Key；下方填写会覆盖它。</div></div>
+      <div class="field"><label>绘图模型</label>
+        <input type="text" id="cfg-imggen-model" placeholder="例如 gpt-image-1 / doubao-seedream-4-0 / flux-1.1-pro" value="${esc(g.model || '')}" />
+        <div class="hint">留空则工具不会启用。</div></div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>绘图接口 Base URL（可留空）</label>
+        <input type="text" id="cfg-imggen-baseurl" placeholder="例如 https://ark.cn-beijing.volces.com/api/v3" value="${esc(g.baseUrl || '')}" />
+        <div class="hint">程序会自动拼 <code>/images/generations</code>，所以填到 <code>/v1</code>（或厂商的 API 根）为止，别把端点整个填进来。</div></div>
+      <div class="field"><label>绘图 API Key（可留空）</label>
+        <div style="display:flex;gap:8px">
+          <input type="password" id="cfg-imggen-apikey" value="${esc(g.hasApiKey ? '******' : '')}" placeholder="留空则沿用聊天模型的 Key" autocomplete="new-password" style="flex:1" />
+          <button class="btn btn-small" id="cfg-imggen-apikey-toggle" type="button">显示</button>
+        </div></div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>默认尺寸</label>
+        <input type="text" id="cfg-imggen-size" value="${esc(g.size || '1024x1024')}" placeholder="1024x1024" />
+        <div class="hint">格式 宽x高。用户在对话里明确指定尺寸时以用户的为准。</div></div>
+      <div class="field"><label>一次生成几张</label>
+        <input type="number" id="cfg-imggen-count" min="1" max="4" value="${esc(g.count ?? 1)}" /></div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>质量 quality（可选）</label>
+        <input type="text" id="cfg-imggen-quality" value="${esc(g.quality || '')}" placeholder="留空不发：high / medium / low" /></div>
+      <div class="field"><label>风格 style（可选）</label>
+        <input type="text" id="cfg-imggen-style" value="${esc(g.style || '')}" placeholder="留空不发：vivid / natural" /></div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>超时（毫秒）</label>
+        <input type="number" id="cfg-imggen-timeout" min="10000" step="5000" value="${esc(g.timeoutMs ?? 120000)}" /></div>
+      <div class="field"><label>本地图片保留张数</label>
+        <input type="number" id="cfg-imggen-keep" min="0" step="10" value="${esc(g.keepFiles ?? 50)}" />
+        <div class="hint">存在 data/images/ 下；0 = 不清理。</div></div>
+    </div>
+
+    <div class="field"><label>角色形象（画图用 · self=true 时由程序原样拼进 prompt）</label>
+      <textarea id="cfg-imggen-character" rows="5" placeholder="只描述长相与穿着：发色发型、瞳色、服饰细节、尾巴、鞋袜、配色。不要写「你是……」这类人设句。">${esc(g.characterPrompt || '')}</textarea>
+      <div class="hint">留空 = 不拼接，全靠模型自己描述外貌（会压缩、会走形，不推荐）。这段与「人设 → 角色设定」是两回事：角色设定给聊天读，这段只给画图用。</div></div>
+
+    <div class="field">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button class="btn btn-small" id="imggen-test-btn" type="button">测试出图</button>
+        <span id="imggen-test-result" class="muted" style="font-size:12px"></span>
+      </div>
+      <img id="imggen-test-preview" alt="" style="display:none;max-width:320px;border-radius:8px;margin-top:8px" />
+    </div>
+
+    <div class="settings-divider"></div>
 
     <h3>发网图（send_image / search_images）</h3>
     <div class="hint">让机器人主动往群里发网上找的图。默认关闭 —— 应当由你显式打开，而不是默认就有。</div>
@@ -2997,9 +3096,18 @@ function renderSecuritySection(c) {
     <div class="field-row">
       <div class="field"><label>单次运行最多发几张</label><input type="number" id="cfg-imgsend-max" min="1" max="20" value="${esc(img.maxPerRun ?? 3)}" /></div>
       <div class="field"><label>单张体积上限（MB）</label><input type="number" id="cfg-imgsend-maxmb" min="1" max="20" value="${esc(img.maxBytesMB ?? 5)}" /></div>
-    </div>
+    </div>`;
+}
 
-    <div class="settings-divider"></div>
+// ── 安全与限制 ───────────────────────────────────────────────────────────
+function renderSecuritySection(c) {
+  const sec = c.security || {};
+  const lock = sec.browseLock || {};
+  const hosts = Array.isArray(lock.hosts) ? lock.hosts.join('\n') : '';
+  return `
+    <h3 id="settings-security">安全与限制</h3>
+    <div class="hint">发网图已移到「图片 / 视频」栏目；这里只管抓取范围与其它安全开关。</div>
+
     <h3>浏览锁定</h3>
     <div class="hint">把"机器人能访问哪些域名"收成白名单，抓网页与下载图片都**逐跳**校验（含重定向目标）。</div>
     <div class="checkbox-row"><input type="checkbox" id="cfg-browselock-enabled" ${lock.enabled === true ? 'checked' : ''} />
@@ -3047,28 +3155,11 @@ function renderApiSection(c) {
       <div class="field"><label>温度</label><input type="number" id="cfg-temperature" step="0.1" min="0" max="2" value="${esc(c.api.temperature)}" /></div>
       <div class="field"><label>单次运行最大工具轮数</label><input type="number" id="cfg-maxrounds" min="1" max="40" value="${esc(c.api.maxRounds)}" /></div>
     </div>
-    <div class="checkbox-row"><input type="checkbox" id="cfg-vision" ${c.api.vision !== false ? 'checked' : ''} />
-      <label for="cfg-vision">图片输入（关闭则移除看图工具，模型只会看到 [图片] 占位符）</label>
-      <span id="vision-switch-hint" class="muted" style="font-size:12px;align-self:center"></span></div>
+    <div class="hint">图片输入、视频输入、发网图、自建文生图已集中到「图片 / 视频」栏目，这里只留模型的容错设置。</div>
 
     <div class="settings-divider"></div>
 
-    <h3>多模态与容错</h3>
-    <div class="field-row">
-      <div class="field"><label>图片输入专用模型（留空 = 用主模型）</label>
-        <input type="text" id="cfg-vision-model" value="${esc(c.api.visionModel || '')}" placeholder="只在真的要"看图"时才切过去" /></div>
-      <div class="field"><label>视频输入专用模型（留空 = 用主模型）</label>
-        <input type="text" id="cfg-video-model" value="${esc(c.api.videoModel || '')}" placeholder="全模态模型" /></div>
-    </div>
-    <div class="field-row">
-      <div class="field"><label>视频读取模式</label>
-        <select id="cfg-video-mode">
-          ${[['auto', '自动：配了视频专用模型就原生读，否则抽帧'], ['native', '强制原生视频输入'], ['frames', '强制抽帧截图'], ['off', '关闭画面（只给元信息）']]
-            .map(([v, t]) => `<option value="${v}" ${String(c.api.videoMode || 'auto') === v ? 'selected' : ''}>${t}</option>`).join('')}
-        </select></div>
-    </div>
-    <div class="checkbox-row"><input type="checkbox" id="cfg-video" ${c.api.video === true ? 'checked' : ''} />
-      <label for="cfg-video">当前模型支持视频输入（勾了才会把视频/GIF 当作 video 部件发给模型）</label></div>
+    <h3>容错</h3>
     <div class="field"><label>备选模型（主模型重试仍失败时逐个降级；每行一个，可写 <code>providerId:模型名</code>）</label>
       <textarea id="cfg-fallback-models" rows="3" placeholder="deepseek-chat&#10;openrouter:anthropic/claude-sonnet-4">${esc((c.api.fallbackModels || []).map((f) => (f.provider ? `${f.provider}:${f.model}` : f.model)).join('\n'))}</textarea></div>
 
@@ -4481,6 +4572,57 @@ function bindSettingsEvents(c) {
     voiceKeyToggle.textContent = show ? '隐藏' : '显示';
   });
 
+  // ── 图片 / 视频：自建文生图 ──
+  const imgGenKeyToggle = $('#cfg-imggen-apikey-toggle');
+  if (imgGenKeyToggle) imgGenKeyToggle.addEventListener('click', () => {
+    const input = $('#cfg-imggen-apikey');
+    if (!input) return;
+    const show = input.type === 'password';
+    input.type = show ? 'text' : 'password';
+    imgGenKeyToggle.textContent = show ? '隐藏' : '显示';
+  });
+
+  // 「测试出图」用界面上当前的值试，不用先保存：空串和掩码 Key 服务端会当作未填。
+  const imgGenTestBtn = $('#imggen-test-btn');
+  if (imgGenTestBtn) imgGenTestBtn.addEventListener('click', async () => {
+    const out = $('#imggen-test-result');
+    const preview = $('#imggen-test-preview');
+    const enteredKey = ($('#cfg-imggen-apikey')?.value || '').trim();
+    const overrides = {
+      provider: $('#cfg-imggen-provider')?.value || '',
+      baseUrl: ($('#cfg-imggen-baseurl')?.value || '').trim(),
+      model: ($('#cfg-imggen-model')?.value || '').trim(),
+      size: ($('#cfg-imggen-size')?.value || '').trim(),
+      count: Number($('#cfg-imggen-count')?.value) || 1,
+      quality: ($('#cfg-imggen-quality')?.value || '').trim(),
+      style: ($('#cfg-imggen-style')?.value || '').trim(),
+      timeoutMs: Number($('#cfg-imggen-timeout')?.value) || 120000,
+      characterPrompt: ($('#cfg-imggen-character')?.value || '').trim(),
+      ...(enteredKey ? { apiKey: enteredKey } : {})
+    };
+    imgGenTestBtn.disabled = true;
+    out.textContent = '出图中…（可能要几十秒）';
+    try {
+      const r = await api('/api/image-gen/test', {
+        method: 'POST',
+        body: JSON.stringify({ prompt: '手机自拍视角，窗边，光线偏亮', self: true, overrides })
+      });
+      const result = r.result || {};
+      if (result.ok) {
+        const kb = Math.max(1, Math.round((result.bytes || 0) / 1024));
+        out.textContent = `成功 ✓ ${result.latencyMs}ms · ${result.size} · ${kb} KB · ${result.model}`;
+        if (preview && result.preview) { preview.src = result.preview; preview.style.display = ''; }
+      } else {
+        out.textContent = `失败：${result.note || '未知错误'}`;
+        if (preview) { preview.style.display = 'none'; preview.removeAttribute('src'); }
+      }
+    } catch (e) {
+      out.textContent = `失败：${e.message}`;
+    } finally {
+      imgGenTestBtn.disabled = false;
+    }
+  });
+
   // 字段一填就自动消警
   voiceEnabledBox?.addEventListener('change', syncVoiceHint);
   for (const sel of ['#cfg-voice-model', '#cfg-voice-secretid', '#cfg-voice-secretkey', '#cfg-voice-voicetype-custom']) {
@@ -5244,14 +5386,8 @@ async function saveConfig({ quiet = false } = {}) {
 
   if (sec === 'api') {
     patch.api = {
-      vision: chk('#cfg-vision', c.api.vision !== false),
       temperature: Number(val('#cfg-temperature', c.api.temperature)) || 0.8,
       maxRounds: Number(val('#cfg-maxrounds', c.api.maxRounds)) || 12,
-      // 多模态与容错：专用模型 / 视频模式 / 备选模型降级
-      visionModel: String(val('#cfg-vision-model', c.api.visionModel || '')).trim(),
-      videoModel: String(val('#cfg-video-model', c.api.videoModel || '')).trim(),
-      videoMode: String(val('#cfg-video-mode', c.api.videoMode || 'auto')),
-      video: chk('#cfg-video', c.api.video === true),
       // 每行一个；`providerId:模型名` 表示该备选走另一个提供商的端点与 Key
       fallbackModels: String(val('#cfg-fallback-models', ''))
         .split('\n').map((s) => s.trim()).filter(Boolean).slice(0, 10)
@@ -5587,19 +5723,53 @@ async function saveConfig({ quiet = false } = {}) {
     patch.bus = { ...(c.bus || {}), enabled: chk('#cfg-bus-enabled', c.bus?.enabled === true) };
   }
 
+  if (sec === 'media') {
+    // 只提交本分区负责的字段：服务端是深合并，未提交的键保持原样。
+    // apiKey 单独处理 —— 输入框里是 '******' 表示"已保存但没改"，不能当新 Key 写回去。
+    const ig = c.imageGen || {};
+    const enteredImgKey = String(val('#cfg-imggen-apikey', '')).trim();
+    patch.imageGen = {
+      enabled: chk('#cfg-imggen-enabled', ig.enabled === true),
+      provider: String(val('#cfg-imggen-provider', ig.provider || '')),
+      baseUrl: String(val('#cfg-imggen-baseurl', ig.baseUrl || '')).trim(),
+      model: String(val('#cfg-imggen-model', ig.model || '')).trim(),
+      size: String(val('#cfg-imggen-size', ig.size || '1024x1024')).trim() || '1024x1024',
+      count: Math.min(4, Math.max(1, Number(val('#cfg-imggen-count', ig.count ?? 1)) || 1)),
+      quality: String(val('#cfg-imggen-quality', ig.quality || '')).trim(),
+      style: String(val('#cfg-imggen-style', ig.style || '')).trim(),
+      responseFormat: ig.responseFormat || '',   // 界面未暴露，保留原值
+      timeoutMs: Math.max(10000, Number(val('#cfg-imggen-timeout', ig.timeoutMs ?? 120000)) || 120000),
+      keepFiles: Math.max(0, Number(val('#cfg-imggen-keep', ig.keepFiles ?? 50)) || 0),
+      characterPrompt: String(val('#cfg-imggen-character', ig.characterPrompt || '')).trim()
+    };
+    if (enteredImgKey && enteredImgKey !== '******') patch.imageGen.apiKey = enteredImgKey;
+
+    // 图片输入 / 视频输入：从「模型 API」搬过来的字段
+    patch.api = {
+      vision: chk('#cfg-vision', c.api?.vision !== false),
+      visionModel: String(val('#cfg-vision-model', c.api?.visionModel || '')).trim(),
+      videoModel: String(val('#cfg-video-model', c.api?.videoModel || '')).trim(),
+      videoMode: String(val('#cfg-video-mode', c.api?.videoMode || 'auto')),
+      video: chk('#cfg-video', c.api?.video === true)
+    };
+
+    // 发网图：从「安全与限制」搬过来的字段
+    patch.security = {
+      imageSend: {
+        enabled: chk('#cfg-imgsend-enabled', c.security?.imageSend?.enabled === true),
+        requirePreview: chk('#cfg-imgsend-preview', c.security?.imageSend?.requirePreview !== false),
+        maxPerRun: Math.max(1, Number(val('#cfg-imgsend-max', c.security?.imageSend?.maxPerRun ?? 3)) || 3),
+        maxBytesMB: Math.max(1, Number(val('#cfg-imgsend-maxmb', c.security?.imageSend?.maxBytesMB ?? 5)) || 5)
+      }
+    };
+  }
+
   if (sec === 'security') {
     const hosts = String(val('#cfg-browselock-hosts', ''))
       .split('\n').map((s) => s.trim()).filter(Boolean).slice(0, 200);
     patch.security = {
       ...(c.security || {}),
       allowPrivateImageHosts: chk('#cfg-allowprivateimage', c.security?.allowPrivateImageHosts === true),
-      imageSend: {
-        ...(c.security?.imageSend || {}),
-        enabled: chk('#cfg-imgsend-enabled', c.security?.imageSend?.enabled === true),
-        requirePreview: chk('#cfg-imgsend-preview', c.security?.imageSend?.requirePreview !== false),
-        maxPerRun: Math.max(1, Number(val('#cfg-imgsend-max', c.security?.imageSend?.maxPerRun ?? 3)) || 3),
-        maxBytesMB: Math.max(1, Number(val('#cfg-imgsend-maxmb', c.security?.imageSend?.maxBytesMB ?? 5)) || 5)
-      },
       browseLock: {
         ...(c.security?.browseLock || {}),
         enabled: chk('#cfg-browselock-enabled', c.security?.browseLock?.enabled === true),
