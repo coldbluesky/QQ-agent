@@ -1366,6 +1366,9 @@ async function saveConfig({ quiet = false } = {}) {
       selfNickname: val('#cfg-selfnick', c.persona.selfNickname || '').trim(),
       participation: val('#cfg-participation', c.persona.participation),
       roleText: val('#cfg-roletext', c.persona.roleText || ''),
+      imagePrompt: val('#cfg-imageprompt', c.persona.imagePrompt || ''),
+      // 尺寸允许脏值（渲染侧 normalizeImageSize 会回落默认），但空串不覆盖旧值以外的语义
+      imageSize: val('#cfg-imagesize', c.persona.imageSize || '1024x1024').trim() || '1024x1024',
       customRules: val('#cfg-customrules', c.persona.customRules || ''),
       systemPromptOverride: val('#cfg-sysprompt', c.persona.systemPromptOverride || '')
     };

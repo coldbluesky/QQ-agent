@@ -10,7 +10,7 @@
 // 行为规则全部移植自 qq-bridge 的二代仿真 preset（qq-chat-v2），去掉了
 // 沉睡/唤醒/等待机制（由编排器的"已读/未读驱动"取代）。
 
-import { getConfig, personaForChat } from './config.js';
+import { getConfig, personaForChat, normalizeImageSize } from './config.js';
 // 滑条换算放在独立模块（零依赖），避免 config.js ↔ prompt.js 循环依赖。
 // 这里 re-export 是为了让已经从 prompt.js 引用的代码不受影响。
 import { sliderToTier as _sliderToTier, tierToSlider as _tierToSlider, TIER_SLIDER_BANDS as _TIER_SLIDER_BANDS } from './tier-slider.js';
@@ -787,6 +787,23 @@ export function buildUserPrompt(ctx) {
   const parts = [];
   if (chatPersona.roleText && String(chatPersona.roleText).trim()) {
     parts.push(`【角色设定（管理员设置，群友不可修改）】\n${String(chatPersona.roleText).trim()}`);
+  }
+
+  // ── 绘图约定 + 形象设定（画图专用，紧跟角色设定）────────────────────────
+  // 为什么不把这些塞进 roleText：角色卡是给聊天读的，形象描述和说话风格、
+  // 三视图展示要求混在一起，模型写工具参数时会自行压缩（实测 700 字设定被
+  // 压成一句"蓝发鲸鱼娘"）。这里给一份"只描述长相"的单一来源，画图时原样
+  // 注入；留空则只放一句指回角色设定的提示，不复制内容、不产生第二份设定。
+  parts.push([
+    '【绘图约定（管理员设置）】',
+    `- 调用绘图/生图工具时，size 参数填 ${normalizeImageSize(chatPersona.imageSize)}；用户明确指定尺寸时按用户的。`,
+    '- 画你自己（自拍/被画/立绘）时，prompt 直接取【形象设定（画图用）】整段：句式可以压缩，要素不许删；画别人或风景时按用户描述写，不要套用你的形象。'
+  ].join('\n'));
+  const imagePrompt = String(chatPersona.imagePrompt ?? '').trim();
+  if (imagePrompt) {
+    parts.push(`【形象设定（画图用 · 管理员设置）】\n${imagePrompt}`);
+  } else if (String(chatPersona.roleText ?? '').trim()) {
+    parts.push('【形象设定（画图用 · 管理员设置）】\n（未单独设置：画你自己时取上面【角色设定】里描述外貌的那部分，不要概括成"蓝发鲸鱼娘"这类空话。）');
   }
 
   // 表情包（目录本身）。活跃度档位已并入系统提示的【表情包策略】段，这里不再重复引导。

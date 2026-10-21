@@ -183,7 +183,16 @@ export const DEFAULT_CONFIG = {
     // ⚠️ 高级功能：默认提示词包含安全规则/工具协议/反AI味等关键约束，
     //    覆盖后这些全部失效，需自行在覆盖文本里写明。留空 = 用内置默认提示词。
     // 可用占位符：{botName} {roleText} {participation}
-    systemPromptOverride: ''
+    systemPromptOverride: '',
+    // 绘图用形象设定（可选）：画"自己"时直接作为生图工具 prompt 的**单一来源**。
+    // 为什么不复用 roleText：角色卡是给聊天读的，里面的形象描述混着说话风格和
+    // 三视图等展示要求，模型写工具参数时会自行压缩（实测把 700 字压成一句
+    // "蓝发鲸鱼娘"）。这里单独存一段"只描述长相"的文本，画图时原样注入。
+    // 留空 = 画图时退回"取 roleText 里的外貌描述"的提示，不额外复制内容。
+    imagePrompt: '',
+    // 绘图默认尺寸（WxH）：绘图/生图工具未显式指定尺寸时用它。
+    // 非法值在 normalizeImageSize 里回落到默认，配置本身不做校验（手改 JSON 不炸）。
+    imageSize: '1024x1024'
   },
   // 用户自定义人设库（保存在配置里，可在设置页添加/选择）
   customPersonas: [],
@@ -644,6 +653,32 @@ export function setRuntimeConfig(cfg) {
  *    且统一模式下 UI 隐藏了分会话编辑入口，用户无从发现也无处改）。
  *    开关关掉后条目恢复生效 —— 数据不删，只是不再参与合并。
  */
+/**
+ * 绘图默认尺寸（WxH）。UI、提示词、技能三处取同一个兜底值。
+ */
+export const DEFAULT_IMAGE_SIZE = '1024x1024';
+
+/**
+ * 规范化绘图尺寸：容忍 `1024x1024` / `1024*1024` / `1024X1024` / 带空格的写法。
+ *
+ * 为什么在这里收敛：尺寸是直接写进提示词、再由模型塞进工具参数的自由文本，
+ * 一旦手滑成 "1024" 或 "big"，生图接口可能报 400 或静默出默认尺寸 ——
+ * 统一在渲染前规范化，配置里就允许存脏值（手改 JSON 不会把机器人搞挂）。
+ */
+export function normalizeImageSize(raw) {
+  const m = String(raw ?? '')
+    .trim()
+    .replace(/[×*]/g, 'x')
+    .toLowerCase()
+    .match(/^(\d{2,5})\s*x\s*(\d{2,5})$/);
+  if (!m) return DEFAULT_IMAGE_SIZE;
+  const w = Number(m[1]);
+  const h = Number(m[2]);
+  // 64 太小无意义，8192 是主流生图接口的上限；越界一律回落，不尝试"修正"
+  if (w < 64 || h < 64 || w > 8192 || h > 8192) return DEFAULT_IMAGE_SIZE;
+  return `${w}x${h}`;
+}
+
 export function personaForChat(chatKey) {
   const base = getConfig().persona || {};
   const [kind, id] = String(chatKey || '').split(':');

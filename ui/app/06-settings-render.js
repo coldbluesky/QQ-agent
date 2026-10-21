@@ -434,6 +434,14 @@ function renderPersonaSection(c) {
     </div>
     <div class="field"><label>角色设定</label>
       <textarea id="cfg-roletext" class="persona-role-text" placeholder="例如：你是运维群里的老油条……">${esc(c.persona.roleText || '')}</textarea></div>
+    <div class="field"><label>形象设定（画图用 · 可选）</label>
+      <textarea id="cfg-imageprompt" class="persona-role-text" style="min-height:90px" placeholder="只描述长相与穿着，例如：成熟比例、深蓝渐变及腰长发、头侧鲸鳍耳、深蓝白女仆装、腰后鲸尾……">${esc(c.persona.imagePrompt || '')}</textarea>
+      <div class="hint">与角色设定分开存：画你自己时这段会被<b>原样</b>当作生图 prompt，所以只写画面要素，不写"你是……"这类人设句。留空则回落到角色设定里的外貌描述。</div></div>
+    <div class="field-row">
+      <div class="field"><label>绘图默认尺寸</label>
+        <input type="text" id="cfg-imagesize" value="${esc(c.persona.imageSize || '1024x1024')}" placeholder="1024x1024" /></div>
+    </div>
+    <div class="hint">调用绘图/生图工具时的默认 size（宽x高），用户在对话里明确指定尺寸时按用户的。格式如 1024x1024、768x1344。</div>
     <div class="field"><label>管理员附加规则（可选，追加到系统提示）</label>
       <textarea id="cfg-customrules" class="persona-role-text" style="min-height:100px">${esc(c.persona.customRules || '')}</textarea></div>
     <div class="field">
@@ -502,6 +510,12 @@ function openGlobalPersonaModal() {
       </div>
       <div class="field"><label>角色设定</label>
         <textarea id="gp-roletext" class="persona-role-text" style="min-height:180px" placeholder="例如：你是运维群里的老油条……">${esc(per.roleText || '')}</textarea></div>
+      <div class="field"><label>形象设定（画图用 · 可选）</label>
+        <textarea id="gp-imageprompt" class="persona-role-text" style="min-height:90px" placeholder="只描述长相与穿着，画你自己时原样作为生图 prompt；留空回落到角色设定里的外貌描述">${esc(per.imagePrompt || '')}</textarea></div>
+      <div class="field-row">
+        <div class="field"><label>绘图默认尺寸</label>
+          <input type="text" id="gp-imagesize" value="${esc(per.imageSize || '1024x1024')}" placeholder="1024x1024" /></div>
+      </div>
       <div class="field"><label>管理员附加规则（可选，追加到系统提示）</label>
         <textarea id="gp-customrules" class="persona-role-text" style="min-height:80px">${esc(per.customRules || '')}</textarea></div>
       <div class="field"><label>系统提示词覆盖（高级 · 可选）</label>
@@ -553,6 +567,8 @@ function openGlobalPersonaModal() {
         selfNickname: overlay.querySelector('#gp-selfnick').value.trim(),
         participation: overlay.querySelector('#gp-participation').value,
         roleText: overlay.querySelector('#gp-roletext').value.trim(),
+        imagePrompt: overlay.querySelector('#gp-imageprompt').value.trim(),
+        imageSize: overlay.querySelector('#gp-imagesize').value.trim() || '1024x1024',
         customRules: overlay.querySelector('#gp-customrules').value.trim(),
         systemPromptOverride: overlay.querySelector('#gp-sysprompt').value.trim()
       }
