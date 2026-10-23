@@ -923,39 +923,67 @@ export function createApp({ log = console.log } = {}) {
         }
       }
 
+      // ── 人设库 ──
+      // ⚠️ id 必须是稳定的：早期这里是 `custom_<数组下标>`，删掉一个后面全部错位，
+      //    前端"删除当前人设"很容易删错人。现在统一走 persona-store（custom:<hex> /
+      //    内置沿用 xiaojingyu 这种老 id），并把人设库的读写都收口到同一处。
       if (pathname === '/api/persona-templates' && method === 'GET') {
-        const { PERSONAS } = await import('./personas.js');
-        const builtins = Object.entries(PERSONAS).map(([id, p]) => ({ id, name: p.name, text: p.text, builtin: true }));
-        const customs = (getConfig().customPersonas || []).map((p, i) => ({
-          id: `custom_${i}`,
+        const { listPersonas, currentPersonaId } = await import('./persona-store.js');
+        const templates = listPersonas().map((p) => ({
+          id: p.builtin ? String(p.id).replace(/^builtin:/, '') : p.id,
           name: p.name,
           text: p.text,
           customRules: p.customRules || '',
-          builtin: false
+          builtin: !!p.builtin,
+          nsfw: p.nsfw === true,
+          memoryKey: p.memoryKey
         }));
-        return json(res, 200, { templates: [...builtins, ...customs] });
+        return json(res, 200, {
+          templates,
+          activeId: String(currentPersonaId() || '').replace(/^builtin:/, '')
+        });
       }
 
-      // 用户自定义人设：新增 / 删除
+      // 新增自定义人设（角色设定允许为空：先建壳再慢慢写）
       if (pathname === '/api/persona-templates' && method === 'POST') {
         const body = await readBody(req).catch(() => ({}));
-        const name = String(body.name ?? '').trim().slice(0, 50);
-        const text = String(body.text ?? '').trim();
-        if (!name || !text) return json(res, 400, { ok: false, error: '人设名称和角色设定都不能为空' });
-        // customRules 允许为空
-        const entry = { name, text };
-        if (String(body.customRules ?? '').trim()) entry.customRules = String(body.customRules).trim();
-        const next = [...(getConfig().customPersonas || []), entry];
-        updateConfig({ customPersonas: next });
-        return json(res, 200, { ok: true, templates: next });
+        const { addPersona } = await import('./persona-store.js');
+        const r = addPersona({
+          name: body.name,
+          text: body.text,
+          customRules: body.customRules,
+          nsfw: body.nsfw === true
+        });
+        if (!r.ok) return json(res, 400, { ok: false, error: r.error });
+        return json(res, 200, { ok: true, persona: r.persona });
       }
 
-      const personaDeleteMatch = /^\/api\/persona-templates\/(custom_\d+)$/.exec(pathname);
-      if (personaDeleteMatch && method === 'DELETE') {
-        const idx = Number(personaDeleteMatch[1].replace('custom_', ''));
-        const next = (getConfig().customPersonas || []).filter((_, i) => i !== idx);
-        updateConfig({ customPersonas: next });
-        return json(res, 200, { ok: true });
+      const personaIdMatch = /^\/api\/persona-templates\/([^/]+)$/.exec(pathname);
+
+      // 保存人设修改（角色卡 / 附加规则 / 名字）——「老是保存不了」的修复点：
+      // 以前设置页只写 config.persona，人设库里那份永远是旧文本，
+      // 下次从列表里选中它就又把旧文本填回去。现在必须回写人设记录。
+      if (personaIdMatch && (method === 'PUT' || method === 'PATCH')) {
+        const { updatePersona } = await import('./persona-store.js');
+        const body = await readBody(req).catch(() => ({}));
+        const r = updatePersona(decodeURIComponent(personaIdMatch[1]), body);
+        if (!r.ok) return json(res, 400, { ok: false, error: r.error });
+        return json(res, 200, { ok: true, persona: r.persona });
+      }
+
+      if (personaIdMatch && method === 'DELETE') {
+        const { deletePersona, listPersonas } = await import('./persona-store.js');
+        const raw = decodeURIComponent(personaIdMatch[1]);
+        let id = raw;
+        // 兼容老前端传来的 custom_<下标>：先换算成稳定 id，避免数组重排后删错人
+        const legacy = /^custom_(\d+)$/.exec(raw);
+        if (legacy) {
+          const customs = listPersonas().filter((p) => !p.builtin);
+          id = customs[Number(legacy[1])]?.id || '';
+        }
+        const r = deletePersona(id);
+        if (!r.ok) return json(res, 400, { ok: false, error: r.error });
+        return json(res, 200, { ok: true, removed: r.removed?.id || id });
       }
 
       // ── 多提供商模型目录 ──
@@ -1304,7 +1332,18 @@ export function createApp({ log = console.log } = {}) {
 
       if (pathname === '/api/config' && method === 'POST') {
         const patch = await readBody(req);
-        const next = updateConfig(patch);
+        updateConfig(patch);
+        // 设置页直接改角色卡时，立刻把改动同步回"当前自定义人设"的记录。
+        // 不这么做的话只有进程重启时 ensurePersonas 才会同步一次 ——
+        // 用户当场切到别的人设再切回来，改动就"没了"（保存人设的经典坑）。
+        if (patch && typeof patch === 'object' && patch.persona) {
+          try {
+            const { syncActivePersonaFromConfig } = await import('./persona-store.js');
+            syncActivePersonaFromConfig();
+          } catch { /* 同步失败不影响本次保存 */ }
+        }
+        // 人设同步可能改了 customPersonas，这里重新取一次活配置再对外返回
+        const next = getConfig();
         store.setMaxPerChat(next.store?.maxMessagesPerChat ?? 0);
         // 会话文件保留上限改了要立即生效（原来是"只在构造时读一次"，要重启才起作用）
         try { sessions.setKeepFiles?.(next.store?.keepSessionFiles ?? 0); } catch { /* ignore */ }

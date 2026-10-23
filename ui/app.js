@@ -20,6 +20,8 @@ const state = {
   chatMessages: [],
   config: null,
   personaTemplates: {},
+  personaActiveId: '',    // 服务端记录的"当前人设"（用于把文本框里的卡认回人设库）
+  personaSelectedId: '',  // 界面上当前选中的人设 id（改文本后不会丢）
   status: null,
   paused: false,
   pauseReason: null,
@@ -2279,9 +2281,38 @@ async function loadSettings() {
   state.visionResults = visionData.results || {};
   state.visionScanning = !!visionData.scanning;
   state.modelPrices = priceData || { prices: [], current: null };
-  state.personaTemplates = {};
-  for (const t of tplData.templates || []) state.personaTemplates[t.id] = { name: t.name, text: t.text, builtin: !!t.builtin };
+  applyPersonaTemplates(tplData);
+  state.personaSelectedId = resolvePersonaSelection(state.config?.persona?.roleText || '');
   renderSettings();
+}
+
+/** 用后端返回的人设列表刷新本地缓存（单独抽出来：添加人设后只需刷新列表，不该整页重渲染）。 */
+function applyPersonaTemplates(tplData) {
+  state.personaTemplates = {};
+  for (const t of tplData?.templates || []) {
+    state.personaTemplates[t.id] = {
+      name: t.name,
+      text: t.text,
+      customRules: t.customRules || '',
+      builtin: !!t.builtin
+    };
+  }
+  state.personaActiveId = tplData?.activeId || '';
+}
+
+/**
+ * 当前"选中"的人设 id。
+ * 优先按角色卡全文精确匹配（改过之后就不该再算作原人设）；
+ * 匹配不上时退回服务端记录的当前人设 —— 只要它还是自定义的，就说明
+ * 文本框里那张卡属于它（用户手改过几句话，不该因此"变成没人设"）。
+ */
+function resolvePersonaSelection(roleText = state.config?.persona?.roleText || '') {
+  const tpls = state.personaTemplates || {};
+  const hit = Object.entries(tpls).find(([, p]) => p.text === roleText);
+  if (hit) return hit[0];
+  const active = state.personaActiveId || '';
+  if (active && tpls[active] && !tpls[active].builtin) return active;
+  return '';
 }
 
 /** 设置页「远程价格表」状态行：来源（在线/缓存/内置）、时间、条目数、错误。 */
@@ -2605,7 +2636,9 @@ function openBatchPriceModal() {
 }
 
 function renderPersonaPicker(c) {
-  const currentId = Object.entries(state.personaTemplates || {}).find(([, p]) => p.text === (c.persona?.roleText || ''))?.[0] || '';
+  // 选中态存在 state 里：只按"文本完全相等"来判会导致用户改一个字之后
+  // 界面就认为"没选任何 人设"（删除按钮消失、名字清空），看起来像保存失败了。
+  const currentId = state.personaSelectedId || resolvePersonaSelection(c.persona?.roleText || '');
   const currentName = state.personaTemplates[currentId]?.name || '';
   return `
     <div class="field-row" style="align-items:flex-end">
@@ -4662,16 +4695,19 @@ function bindSettingsEvents(c) {
   // ── 人设区块事件 ──
   const personaPick = $('#cfg-persona-pick');
   function currentPersonaId() {
-    const roleText = $('#cfg-roletext')?.value ?? '';
-    const found = Object.entries(state.personaTemplates || {}).find(([, p]) => p.text === roleText);
-    return found ? found[0] : '';
+    if (state.personaSelectedId) return state.personaSelectedId;
+    const id = resolvePersonaSelection($('#cfg-roletext')?.value ?? '');
+    state.personaSelectedId = id;
+    return id;
   }
   function syncPersonaButtons() {
     const id = currentPersonaId();
     const tpl = state.personaTemplates[id];
-    const isCustom = id.startsWith('custom_');
+    const isCustom = !!tpl && !tpl.builtin;
     const delBtn = $('#del-persona-btn');
     if (delBtn) delBtn.classList.toggle('hidden', !isCustom);
+    const input = $('#cfg-persona-pick');
+    if (input) input.value = tpl?.name || '';
     const hint = $('#persona-pick-hint');
     if (hint) hint.textContent = tpl ? (tpl.builtin ? '内置人设' : '自定义人设') : '';
   }
@@ -4683,27 +4719,36 @@ function bindSettingsEvents(c) {
   const delPersonaBtn = $('#del-persona-btn');
   if (delPersonaBtn) delPersonaBtn.addEventListener('click', async () => {
     const id = currentPersonaId();
-    if (!id.startsWith('custom_')) return;
     const tpl = state.personaTemplates[id];
-    if (!tpl) return;
+    if (!tpl || tpl.builtin) return;
     if (!confirm(`确定删除自定义人设「${tpl.name}」？`)) return;
     try {
-      await api(`/api/persona-templates/${id}`, { method: 'DELETE', body: '{}' });
-      $('#cfg-roletext').value = state.personaTemplates.xiaojingyu?.text || '';
-      $('#cfg-customrules').value = '';
+      await api(`/api/persona-templates/${encodeURIComponent(id)}`, { method: 'DELETE', body: '{}' });
+      delete state.personaTemplates[id];
+      state.personaSelectedId = '';
       await loadSettings();
     } catch (e) {
-      $('#persona-pick-hint').textContent = `删除失败：${e.message}`;
+      const hint = $('#persona-pick-hint');
+      if (hint) hint.textContent = `删除失败：${e.message}`;
     }
   });
   const savePersonaBtn = $('#save-persona-btn');
   if (savePersonaBtn) savePersonaBtn.addEventListener('click', async () => {
+    const setResult = (text, keep = false) => {
+      const el = $('#persona-save-result');
+      if (!el) return;
+      el.textContent = text;
+      if (!keep) setTimeout(() => { if (el.textContent === text) el.textContent = ''; }, 4000);
+    };
+    savePersonaBtn.disabled = true;
     try {
-      await saveConfig();
-      $('#persona-save-result').textContent = '人设已保存 ✓';
-      setTimeout(() => { $('#persona-save-result').textContent = ''; }, 3000);
+      await saveConfig();                       // 先落到活配置（roleText / customRules）
+      const msg = await persistPersonaCard();   // 再回写人设库，否则下次选中又是旧文本
+      setResult(msg);
     } catch (e) {
-      $('#persona-save-result').textContent = `保存失败：${e.message}`;
+      setResult(`保存失败：${e.message}`, true);
+    } finally {
+      savePersonaBtn.disabled = false;
     }
   });
   syncPersonaButtons();
@@ -4853,6 +4898,65 @@ function openToolBreakdown() {
 
 // ── 人设选择/添加 模态框 ──
 
+/**
+ * 把「角色设定 / 附加规则」文本框里的内容回写进人设库。
+ * 返回给用户看的结果文案（由保存按钮显示）。
+ *
+ * 拆出来单独做的原因（老 bug）：保存只写 config.persona.roleText，
+ * 人设库里那份不动 —— 用户以为存下了，从列表再选一次就被旧文本盖回去。
+ */
+async function persistPersonaCard() {
+  const roleText = $('#cfg-roletext')?.value ?? '';
+  const rules = $('#cfg-customrules')?.value ?? '';
+  const id = state.personaSelectedId;
+  const tpl = id ? state.personaTemplates[id] : null;
+
+  if (tpl && !tpl.builtin) {
+    const r = await api(`/api/persona-templates/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      body: JSON.stringify({ text: roleText, customRules: rules })
+    });
+    state.personaTemplates[id] = {
+      ...tpl,
+      name: r?.persona?.name || tpl.name,
+      text: roleText,
+      customRules: rules
+    };
+    return '人设已保存 ✓';
+  }
+
+  // 内置人设不能改：改了文本还挂在"内置"名下，下次选中它就会被原卡盖回去。
+  // 所以给一个明确的落点 —— 另存成自定义人设（用户点取消则表示只改当前设置）。
+  if (tpl && tpl.builtin && roleText !== tpl.text) {
+    const forkName = `${tpl.name}（自定义）`;
+    const go = confirm(
+      `「${tpl.name}」是内置人设，不能直接修改。\n`
+      + `要把当前角色卡另存为新的人设「${forkName}」吗？\n\n`
+      + '点「取消」= 只对当前设置生效（下次选中内置人设会被还原）'
+    );
+    if (!go) return '已保存到当前设置（未另存为人设）';
+    const r = await api('/api/persona-templates', {
+      method: 'POST',
+      body: JSON.stringify({ name: forkName, text: roleText, customRules: rules })
+    });
+    const newId = r?.persona?.id;
+    if (newId) {
+      state.personaTemplates[newId] = { name: r.persona.name || forkName, text: roleText, customRules: rules, builtin: false };
+      state.personaSelectedId = newId;
+      const input = $('#cfg-persona-pick');
+      if (input) input.value = state.personaTemplates[newId].name;
+      $('#del-persona-btn')?.classList.remove('hidden');
+      const hint = $('#persona-pick-hint');
+      if (hint) hint.textContent = '自定义人设';
+    }
+    return `已另存为人设「${state.personaTemplates[newId]?.name || forkName}」`;
+  }
+
+  // 既没选中人设、文本也不属于任何一份：这段卡是手写的/来自老配置。
+  // 不硬塞进人设库（塞错地方比不塞更糟），但要说明白，而不是假装"已保存"。
+  return tpl ? '已保存 ✓' : '已保存到当前设置（这段角色卡不属于任何人设，可先「添加人设」再保存）';
+}
+
 /** 选择人设：弹窗列出所有人设（含自定义），点击后填入角色设定文本框。 */
 function openPersonaPicker() {
   const entries = Object.entries(state.personaTemplates || {});
@@ -4860,13 +4964,14 @@ function openPersonaPicker() {
     $('#persona-pick-hint').textContent = '人设列表为空';
     return;
   }
+  const currentId = state.personaSelectedId || resolvePersonaSelection($('#cfg-roletext')?.value ?? '');
   const overlay = modelModalShell({
     head: '选择人设',
     body: `
       <div class="model-modal-right" id="persona-list" style="flex:1">
         ${entries.map(([id, p]) => `
           <div class="mm-model" data-id="${esc(id)}">
-            <span class="mm-check">${(state.personaTemplates[id]?.text === ($('#cfg-roletext')?.value ?? '')) ? '✓' : ''}</span>
+            <span class="mm-check">${id === currentId ? '✓' : ''}</span>
             <span>${esc(p.name)}</span>
             <span class="muted" style="font-size:11px">${p.builtin ? '内置' : '自定义'}</span>
           </div>`).join('')}
@@ -4882,9 +4987,15 @@ function openPersonaPicker() {
         $('#cfg-customrules').value = tpl.customRules || '';
         const input = $('#cfg-persona-pick');
         if (input) input.value = tpl.name;
+        state.personaSelectedId = id;
+        // 选中只是切换文本框，不立刻落盘：用户可能只是看看。
+        // 真正生效靠下面的「保存人设修改」（它会把卡片回写到这份人设）。
+        const delBtn = $('#del-persona-btn');
+        if (delBtn) delBtn.classList.toggle('hidden', !!tpl.builtin);
+        const hint = $('#persona-pick-hint');
+        if (hint) hint.textContent = tpl.builtin ? '内置人设' : '自定义人设';
       }
       closeModelModal(overlay);
-      syncPersonaButtons();
     });
   });
   overlay.querySelector('#persona-cancel').addEventListener('click', () => closeModelModal(overlay));
@@ -4916,19 +5027,26 @@ function openPersonaCreateModal() {
     const text = overlay.querySelector('#new-persona-text').value.trim();
     const customRules = overlay.querySelector('#new-persona-rules').value.trim();
     if (!name) { $('#persona-pick-hint').textContent = '人设名称不能为空'; return; }
-    if (!text) { $('#persona-pick-hint').textContent = '角色设定不能为空'; return; }
     try {
-      await api('/api/persona-templates', {
+      // 角色设定允许为空：先建一个只带名字的壳，切过去再慢慢写（后端 addPersona 同样放行）
+      const r = await api('/api/persona-templates', {
         method: 'POST',
         body: JSON.stringify({ name, text, customRules })
       });
       closeModelModal(overlay);
+      // ⚠️ 这里只刷新人设列表，不要 loadSettings()：
+      // 整页重渲染会按 config.persona.roleText 重填文本框，刚输入的人设当场被冲掉
+      // （这就是"添加人设后文本没了"的来源）。
+      const tplRes = await api('/api/persona-templates').catch(() => null);
+      if (tplRes) applyPersonaTemplates(tplRes);
+      const newId = r?.persona?.id || '';
+      if (newId) state.personaSelectedId = newId;
       $('#cfg-roletext').value = text;
       $('#cfg-customrules').value = customRules;
       const input = $('#cfg-persona-pick');
       if (input) input.value = name;
-      $('#persona-pick-hint').textContent = `人设「${name}」已添加。记得点「保存人设修改」使当前填写生效。`;
-      await loadSettings();
+      $('#del-persona-btn')?.classList.remove('hidden');
+      $('#persona-pick-hint').textContent = `人设「${name}」已添加。点「保存人设修改」让它成为当前人设。`;
     } catch (e) {
       $('#persona-pick-hint').textContent = `添加失败：${e.message}`;
     }

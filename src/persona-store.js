@@ -263,10 +263,16 @@ export function ensurePersonas({ force = false } = {}) {
   // 当前人设的卡片以 config.persona.roleText 为准：用户可能刚在设置页改过它。
   // 不同步的话，「按名字认领」回来的那份记录会一直停留在旧文本，
   // 下次切换走再切回来就把用户的修改盖回去了。
+  //
+  // ⚠️ 但有一种情况绝不能同步：角色卡内容其实属于**别的**人设。
+  //   activateId 还是 A、用户从人设列表里点了 B（文本框换成 B 的卡）之后，
+  //   roleText 是 B 的文本；盲目同步会把 A 的卡片改成 B 的（A 就废了）。
+  //   所以先看这段文本是否已被另一个人设原样持有 —— 是的话不认领。
   if (active && !active.builtin) {
     const roleNow = String(cfg.persona?.roleText || '').trim();
     const rulesNow = String(cfg.persona?.customRules || '');
-    if (roleNow && (String(active.text || '').trim() !== roleNow || String(active.customRules || '') !== rulesNow)) {
+    const belongsToOther = roleNow && all.some((p) => p.id !== active.id && String(p.text || '').trim() === roleNow);
+    if (roleNow && !belongsToOther && (String(active.text || '').trim() !== roleNow || String(active.customRules || '') !== rulesNow)) {
       const idx = nextCustoms.findIndex((p) => p.id === active.id);
       if (idx >= 0) {
         const copy = nextCustoms.slice();
@@ -386,8 +392,59 @@ export function renamePersona(id, name) {
 }
 
 /**
+ * 改写一份自定义人设的角色卡 / 附加规则 / 名字 / R18 属性。
+ *
+ * ⚠️ 这是「保存人设修改」必须落到的地方。
+ * 只写 config.persona.roleText 是不够的：人设库里那份还停在旧文本，
+ * 下次从人设列表里把它选中一遍，旧文本就被填回文本框，用户的修改看起来"没保存"。
+ * （老 bug 的直接成因：设置页保存从不回写人设库，只有进程重启时 ensurePersonas
+ *  对"当前正在用的那份"顺手同步一次，所以别的自定义人设永远同步不到。）
+ *
+ * memoryKey 一律不动 —— 改文本不能让记忆目录漂走。
+ */
+export function updatePersona(id, { name, text, customRules, nsfw } = {}) {
+  const key = String(id || '');
+  if (!key.startsWith('custom:')) {
+    return { ok: false, error: '内置人设不能直接修改，请另存为自定义人设' };
+  }
+  const { list } = normalizeCustoms();
+  const idx = list.findIndex((p) => p.id === key);
+  if (idx < 0) return { ok: false, error: '人设不存在' };
+
+  const rec = { ...list[idx] };
+  if (name !== undefined) {
+    const nm = String(name || '').trim().slice(0, 60);
+    if (!nm) return { ok: false, error: '人设名称不能为空' };
+    rec.name = nm;
+  }
+  if (text !== undefined) rec.text = String(text || '');
+  if (customRules !== undefined) rec.customRules = String(customRules || '');
+  if (nsfw !== undefined) rec.nsfw = nsfw === true;
+
+  const next = list.slice();
+  next[idx] = rec;
+  try { updateConfig({ customPersonas: next }); } catch (error) {
+    return { ok: false, error: `写入配置失败：${error?.message ?? error}` };
+  }
+
+  // 改的正好是"当前在用的那份"：活配置一起更新，提示词立刻生效。
+  // 不是当前人设时绝不去碰 config.persona —— 否则会把别人设的卡片顶掉。
+  const cfg = getConfig();
+  if (String(cfg.persona?.activeId || '') === rec.id) {
+    try {
+      updateConfig({ persona: { roleText: rec.text, customRules: rec.customRules || '', nsfw: rec.nsfw === true } });
+    } catch { /* 活配置写失败不影响人设库 */ }
+  }
+  return { ok: true, persona: rec };
+}
+
+/**
  * 设置页直接改了 roleText / customRules 时，同步回当前人设的记录。
  * 不这么做的话：改完角色卡 → 切到别人设 → 切回来，改动就没了。
+ *
+ * 返回 true 表示确实写了人设库。
+ * ⚠️ 只在"这段卡确实属于当前人设"时同步：如果 roleText 已经被别的人设
+ *   原样持有（用户刚从列表里选了别人），写进去就是把当前人设的卡毁掉。
  */
 export function syncActivePersonaFromConfig() {
   const cfg = getConfig();
@@ -398,6 +455,9 @@ export function syncActivePersonaFromConfig() {
   const idx = list.findIndex((p) => p.id === activeId);
   if (idx < 0) return false;
   const text = String(cfg.persona?.roleText || '');
+  if (text.trim() && list.some((p) => p.id !== activeId && String(p.text || '').trim() === text.trim())) {
+    return false;   // 这张卡是别人设的，不是当前人设被改了
+  }
   const rules = String(cfg.persona?.customRules || '');
   const nsfw = cfg.persona?.nsfw === true;
   const touchReaction = cfg.persona?.touchReaction !== false;
