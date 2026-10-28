@@ -4709,7 +4709,14 @@ function bindSettingsEvents(c) {
     const input = $('#cfg-persona-pick');
     if (input) input.value = tpl?.name || '';
     const hint = $('#persona-pick-hint');
-    if (hint) hint.textContent = tpl ? (tpl.builtin ? '内置人设' : '自定义人设') : '';
+    if (hint) {
+      if (!tpl) hint.textContent = '';
+      else {
+        // "选中"和"当前生效"是两件事：只有 activeId 指向它时，记忆目录才跟着它走。
+        const needSwitch = id !== String(state.personaActiveId || '');
+        hint.textContent = `${tpl.builtin ? '内置人设' : '自定义人设'}${needSwitch ? ' · 点「保存设置」切换到此卡' : ' · 当前生效'}`;
+      }
+    }
   }
   if (personaPick) {
     personaPick.addEventListener('click', () => openPersonaPicker());
@@ -4946,10 +4953,19 @@ async function persistPersonaCard() {
       const input = $('#cfg-persona-pick');
       if (input) input.value = state.personaTemplates[newId].name;
       $('#del-persona-btn')?.classList.remove('hidden');
+      // 新建的这份就是刚保存的那张卡：顺手切成当前人设，省得用户再点一次保存。
+      // （activeId 一变，记忆目录跟着换到新人设那棵树，旧人设的记忆不再注入。）
+      try {
+        const d = await api('/api/config', { method: 'POST', body: JSON.stringify({ persona: { activeId: newId } }) });
+        if (d?.config) {
+          state.config = d.config;
+          state.personaActiveId = String(d.config.persona?.activeId || '').replace(/^builtin:/, '');
+        }
+      } catch { /* 切换失败不影响"人设已存下"这件事 */ }
       const hint = $('#persona-pick-hint');
-      if (hint) hint.textContent = '自定义人设';
+      if (hint) hint.textContent = '自定义人设 · 当前生效';
     }
-    return `已另存为人设「${state.personaTemplates[newId]?.name || forkName}」`;
+    return `已另存为人设「${state.personaTemplates[newId]?.name || forkName}」并切换为当前人设`;
   }
 
   // 既没选中人设、文本也不属于任何一份：这段卡是手写的/来自老配置。
@@ -4993,7 +5009,12 @@ function openPersonaPicker() {
         const delBtn = $('#del-persona-btn');
         if (delBtn) delBtn.classList.toggle('hidden', !!tpl.builtin);
         const hint = $('#persona-pick-hint');
-        if (hint) hint.textContent = tpl.builtin ? '内置人设' : '自定义人设';
+        if (hint) {
+          // 选中不等于生效：真正切人设（连着记忆目录一起换）要靠上面的「保存设置」，
+          // 这里把话说明白，否则用户以为选一下就完事了。
+          const needSwitch = id !== String(state.personaActiveId || '');
+          hint.textContent = `${tpl.builtin ? '内置人设' : '自定义人设'}${needSwitch ? ' · 点「保存设置」切换到此卡' : ' · 当前生效'}`;
+        }
       }
       closeModelModal(overlay);
     });
@@ -5667,13 +5688,21 @@ async function saveConfig({ quiet = false } = {}) {
   }
 
   if (sec === 'persona') {
-    patch.persona = {
+    const personaPatch = {
       botName: val('#cfg-botname', c.persona.botName).trim() || '小鲸鱼',
       selfNickname: val('#cfg-selfnick', c.persona.selfNickname || '').trim(),
       participation: val('#cfg-participation', c.persona.participation),
       roleText: val('#cfg-roletext', c.persona.roleText || ''),
       customRules: val('#cfg-customrules', c.persona.customRules || '')
     };
+    // 在列表里选过别的人设 → 这次保存同时把它切成"当前人设"。
+    // 只提交 roleText 不提交 activeId 的话，角色卡换了、记忆目录还挂在旧人设上，
+    // 于是"人设是新的、记忆是旧的"（后端收到 activeId 才会走 setActivePersona）。
+    const pickedId = String(state.personaSelectedId || '');
+    if (pickedId && pickedId !== String(state.personaActiveId || '')) {
+      personaPatch.activeId = pickedId;
+    }
+    patch.persona = personaPatch;
   }
 
   if (sec === 'allow') {
@@ -5899,6 +5928,10 @@ async function saveConfig({ quiet = false } = {}) {
 
   const data = await api('/api/config', { method: 'POST', body: JSON.stringify(patch) });
   state.config = data.config;
+  // 这次保存可能顺带切换了人设（patch.persona.activeId）：同步界面缓存，
+  // 否则下一次保存会拿旧的 personaActiveId 去比较，反复触发无意义的切换。
+  const activeNow = String(data.config?.persona?.activeId || '').replace(/^builtin:/, '');
+  if (activeNow) state.personaActiveId = activeNow;
   if (!quiet) $('#model-label').textContent = `模型：${state.config.api.model || '未设置'}`;
   return data;
 }

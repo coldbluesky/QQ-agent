@@ -1332,7 +1332,38 @@ export function createApp({ log = console.log } = {}) {
 
       if (pathname === '/api/config' && method === 'POST') {
         const patch = await readBody(req);
+        // ── 切换人设：activeId 不能直接落盘 ──
+        // activeId 和 roleText/customRules/memoryKey 是一组状态。只写 activeId 会造成
+        // "角色卡是 A、记忆目录仍挂在 B"的半切换：提示词里人设变了，但【记忆】读的还是
+        // 旧人设那棵树，机器人于是继续用旧身份说话（私聊干净、群聊带旧称呼的经典来源）。
+        // 所以这里把 activeId 摘出来交给 setActivePersona 统一同步，其余字段照常合并。
+        const wantActiveRaw = patch && typeof patch === 'object' && patch.persona && patch.persona.activeId !== undefined
+          ? String(patch.persona.activeId || '').trim()
+          : '';
+        if (wantActiveRaw && patch.persona && typeof patch.persona === 'object') delete patch.persona.activeId;
         updateConfig(patch);
+        if (wantActiveRaw) {
+          try {
+            const { setActivePersona, getPersona, currentPersonaId } = await import('./persona-store.js');
+            // 前端传的是列表里的 id（内置人设被剥掉了 builtin: 前缀），这里补回来
+            const id = getPersona(wantActiveRaw)
+              ? wantActiveRaw
+              : (getPersona(`builtin:${wantActiveRaw}`) ? `builtin:${wantActiveRaw}` : '');
+            if (id && id !== String(currentPersonaId() || '')) {
+              const r = setActivePersona(id);
+              // setActivePersona 写回的是人设库里那一份的文本；用户这次在设置页文本框里的
+              // 修改优先（否则"选中人设 + 顺手改两句 + 保存"会把刚改的内容冲掉）。
+              if (r.ok) {
+                const keep = {};
+                if (patch.persona && patch.persona.roleText !== undefined) keep.roleText = String(patch.persona.roleText || '');
+                if (patch.persona && patch.persona.customRules !== undefined) keep.customRules = String(patch.persona.customRules || '');
+                if (Object.keys(keep).length) updateConfig({ persona: keep });
+              }
+            }
+          } catch (error) {
+            console.error('[persona] 切换人设失败:', error?.message ?? error);
+          }
+        }
         // 设置页直接改角色卡时，立刻把改动同步回"当前自定义人设"的记录。
         // 不这么做的话只有进程重启时 ensurePersonas 才会同步一次 ——
         // 用户当场切到别的人设再切回来，改动就"没了"（保存人设的经典坑）。

@@ -2029,6 +2029,33 @@ refs:
     pass('图搜解析：Bing/百度结构解析与去重 + 反爬页识别 + 读取上限');
   }
 
+  // ── 场景 32：切换人设必须同时落盘 activeId ──
+  // 只改 roleText 不切 activeId，就会出现"角色卡是 A、记忆目录还挂在 B"的半切换：
+  // 提示词里人设换了，【记忆】读的仍是旧人设那棵树（私聊干净、群聊带旧称呼的成因）。
+  {
+    const base = cfg.server.port;
+    const post = async (p, body) => (await fetch(`http://127.0.0.1:${base}${p}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body)
+    })).json();
+
+    const made = await post('/api/persona-templates', { name: '审计新人设', text: '你现在叫审计新人设。' });
+    const newId = made?.persona?.id || '';
+    assert.ok(newId.startsWith('custom:'), '新建人设应拿到稳定的 custom: id');
+
+    const switched = await post('/api/config', { persona: { activeId: newId } });
+    assert.strictEqual(switched?.config?.persona?.activeId, newId, '保存设置带 activeId 时，当前人设应真的切过去');
+    assert.ok(String(switched?.config?.persona?.roleText || '').includes('审计新人设'), '切换后角色卡应同步为目标人设的文本');
+
+    const listed = await (await fetch(`http://127.0.0.1:${base}/api/persona-templates`)).json();
+    assert.strictEqual(listed?.activeId, newId, '人设列表回报的 activeId 应与切换结果一致（否则界面永远显示旧人设）');
+
+    // 列表里内置人设的 id 被剥掉了 builtin: 前缀，切换时必须能补回来
+    const back = await post('/api/config', { persona: { activeId: 'xiaojingyu' } });
+    assert.strictEqual(back?.config?.persona?.activeId, 'builtin:xiaojingyu', '传裸 id 也应能切回内置人设');
+
+    pass('人设切换：activeId 落盘 + 角色卡同步 + 内置 id 兼容');
+  }
+
   // ── 收尾 ──
   await app.stop();
   onebotWs.close();
